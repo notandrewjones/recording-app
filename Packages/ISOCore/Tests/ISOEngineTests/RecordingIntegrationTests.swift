@@ -477,4 +477,65 @@ import Testing
         #expect(first.frames > 90)
         #expect(harness.indexRecords(first).count == first.frames)
     }
+
+    /// Apple's own schema, which ships inside iMovie. Skipped on a Mac without it.
+    private static let appleDTD = "/Applications/iMovie.app/Contents/Frameworks/Interchange.framework/Versions/A/Resources/FCPXMLv1_11.dtd"
+
+    @Test func exportsAreWrittenAndPassApplesFCPXMLSchema() throws {
+        let harness = try Harness(environment: environment, source: SyntheticSource(faults: [90: .loseSignal(frames: 30)]))
+        harness.record(frames: 210)
+
+        let exportDirectory = (harness.session.layout.sessionDirectory as NSString).appendingPathComponent("export")
+        let names = try FileManager.default.contentsOfDirectory(atPath: exportDirectory)
+        #expect(names.contains("test.fcpxml"))
+        #expect(names.contains("test.xml"))
+        #expect(names.contains("test_Cam.edl"))
+
+        guard FileManager.default.fileExists(atPath: Self.appleDTD) else { return }
+        let path = (exportDirectory as NSString).appendingPathComponent("test.fcpxml")
+        let result = try ProcessRunner.run("/usr/bin/xmllint", ["--noout", "--dtdvalid", Self.appleDTD, path])
+        #expect(result.status == 0, "\(result.output)")
+    }
+
+    @Test func controlServerServesCommandsAndRefusesBrowsers() async throws {
+        let received = UnfairLockedArray()
+        let server = ControlServer { command in
+            received.append(command)
+            return ControlResponse(status: 200, body: Data("{\"ok\":true}".utf8))
+        }
+        let port: UInt16 = try await withCheckedThrowingContinuation { continuation in
+            do {
+                try server.start(port: 0) { continuation.resume(with: $0) }
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
+        defer { server.stop() }
+
+        var start = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/api/v1/record/start")!)
+        start.httpMethod = "POST"
+        let (data, response) = try await URLSession.shared.data(for: start)
+        #expect((response as? HTTPURLResponse)?.statusCode == 200)
+        #expect(String(decoding: data, as: UTF8.self).contains("ok"))
+
+        var browser = start
+        browser.setValue("https://evil.example", forHTTPHeaderField: "Origin")
+        let (_, refused) = try await URLSession.shared.data(for: browser)
+        #expect((refused as? HTTPURLResponse)?.statusCode == 403)
+
+        #expect(received.values == [.startRecording])
+    }
+}
+
+final class UnfairLockedArray: @unchecked Sendable {
+    private let lock = UnfairLock()
+    private var stored: [ControlCommand] = []
+
+    func append(_ command: ControlCommand) {
+        lock.withLock { stored.append(command) }
+    }
+
+    var values: [ControlCommand] {
+        lock.withLock { stored }
+    }
 }

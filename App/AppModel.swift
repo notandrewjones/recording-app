@@ -65,6 +65,7 @@ final class AppModel: ObservableObject {
     private let discovery = DLDiscovery()
     private var refreshTimer: Timer?
     private var syntheticCount = 0
+    private var controlServer: ControlServer?
     private var inputRebuildPending = false
     private let metrics = SystemMetrics()
     private var lastMetricsUptime: UInt64 = 0
@@ -89,6 +90,76 @@ final class AppModel: ObservableObject {
         }
         recoverInterruptedSessions()
         scheduleAutoRecord()
+        startControlServer()
+    }
+
+    /// Serves `/api/v1` on the loopback interface, on port 9455 unless `controlPort` says otherwise. 0 turns it off.
+    private func startControlServer() {
+        UserDefaults.standard.register(defaults: ["controlPort": 9455])
+        let port = UserDefaults.standard.integer(forKey: "controlPort")
+        guard port > 0, port <= Int(UInt16.max) else { return }
+        let server = ControlServer { [weak self] command in
+            guard let self else { return ControlResponse(status: 503, error: "Shutting down.") }
+            return await self.handle(command)
+        }
+        do {
+            try server.start(port: UInt16(port)) { [weak self] result in
+                if case .failure(let error) = result {
+                    Task { @MainActor in self?.message = "Control API unavailable on port \(port): \(error.localizedDescription)" }
+                }
+            }
+            controlServer = server
+        } catch {
+            message = "Control API unavailable: \(error.localizedDescription)"
+        }
+    }
+
+    private func handle(_ command: ControlCommand) -> ControlResponse {
+        switch command {
+        case .status:
+            break
+        case .startRecording:
+            if !isRecording { recordAll() }
+            if !isRecording { return ControlResponse(status: 409, error: message ?? "Could not start recording.") }
+        case .stopRecording:
+            stopAll()
+        case .addMarker(let label):
+            guard let session else { return ControlResponse(status: 409, error: "Not recording.") }
+            session.addMarker(label: label)
+        case .setArmed(let inputID, let armed):
+            guard let tile = tiles.first(where: { $0.id == inputID }) else {
+                return ControlResponse(status: 404, error: "Unknown input.")
+            }
+            guard !tile.isRecording else { return ControlResponse(status: 409, error: "Input is recording.") }
+            tile.isArmed = armed
+        }
+        return ControlResponse(status: 200, body: statusJSON())
+    }
+
+    private func statusJSON() -> Data {
+        let inputs: [[String: Any]] = tiles.map { tile in
+            var input: [String: Any] = [
+                "id": tile.id,
+                "label": tile.source.input.displayName,
+                "armed": tile.isArmed,
+                "recording": tile.isRecording,
+                "signal": tile.status.signal.format != nil,
+            ]
+            if let format = tile.status.signal.format { input["format"] = format.displayName }
+            if let recorder = tile.recorderStatus {
+                input["frames"] = recorder.totalFrames
+                input["repeatedFrames"] = recorder.repeatedFrames
+                input["restarts"] = recorder.restarts
+            }
+            return input
+        }
+        let object: [String: Any] = [
+            "recording": isRecording,
+            "finalizing": isFinalizing,
+            "freeBytes": freeBytes,
+            "inputs": inputs,
+        ]
+        return (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])) ?? Data()
     }
 
     /// `-autoRecordSeconds N` records for N seconds after launch, for unattended smoke tests.

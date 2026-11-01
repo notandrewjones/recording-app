@@ -36,6 +36,37 @@ Recordings go to `~/Movies/ISO Recorder`. Change this with
 
 Output settings are under ISO Recorder > Settings (⌘,), or the codec name in the status bar.
 
+## Control API
+
+The app listens on `127.0.0.1:9455`, for Bitfocus Companion's generic HTTP module, Stream Deck actions or
+curl. Change the port with `defaults write com.notandrewjones.ISORecorder controlPort -int 9000`, and use 0
+to turn it off. Replies are JSON.
+
+| Request | Effect |
+|---|---|
+| `GET /api/v1/status` | Recording state, free space and each input |
+| `POST /api/v1/record/start` | Record All |
+| `POST /api/v1/record/stop` | Stop All |
+| `POST /api/v1/marker` | Adds a marker. Optional body: `{"label": "Goal"}` |
+| `POST /api/v1/inputs/<id>/arm` | Arms an input |
+| `POST /api/v1/inputs/<id>/disarm` | Disarms an input |
+
+It only binds to loopback, so a Companion on another machine needs it opened up first. Requests carrying a
+browser `Origin` header or a non-local `Host` are refused, so a web page cannot control a recording.
+
+## NLE exports
+
+Each session writes `export/` when it finishes:
+
+| File | Open in | Contains |
+|---|---|---|
+| `<session>.fcpxml` | Final Cut Pro, DaVinci Resolve | A multicam clip with one angle per input |
+| `<session>.xml` | Premiere Pro, DaVinci Resolve | A sequence with each input on its own track, aligned |
+| `<session>_<input>.edl` | Anything that reads CMX 3600 | One EDL per input |
+
+Rerun with `isorec export <session>`, for example after moving the session folder, because exports use
+absolute paths.
+
 ## Record without the app
 
 ```sh

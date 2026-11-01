@@ -129,6 +129,7 @@ public enum SessionRecovery {
             }
         }
         finalizer.wait()
+        _ = try? SessionExport.write(directory: directory)
 
         let segments = store.snapshot.inputs.flatMap(\.segments)
         return Report(

@@ -105,9 +105,10 @@ public final class RecordingSession: @unchecked Sendable {
         store.update { $0.markers.append(marker) }
     }
 
-    /// Blocks until every segment is closed and finalized.
+    /// Blocks until every segment is closed and finalized, then writes the NLE exports.
     public func waitUntilFinished() {
         recorders.forEach { $0.waitForSegments() }
         finalizer.wait()
+        _ = try? SessionExport.write(directory: layout.sessionDirectory)
     }
 }

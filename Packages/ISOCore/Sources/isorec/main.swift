@@ -5,10 +5,11 @@ import ISOEngine
 // Headless recorder for testing the engine with synthetic sources.
 //
 //   isorec record --root DIR [--name NAME] [--inputs N] [--seconds S] [--codec hq|lt|422|proxy|4444]
-//                 [--no-audio] [--audio-channels 2|8|16] [--grain] [--min-free-mb MB]
+//                 [--no-audio] [--audio-channels 2|8|16] [--grain] [--min-free-mb MB] [--stagger S]
 //                 [--encoder hevc-hw|hevc-sw|x265|h264-hw|h264-sw|x264] [--rate cbr|abr|vbr|cq]
 //                 [--kbps N] [--max-kbps N] [--quality N] [--keyframe S] [--preset NAME] [--chroma422]
 //   isorec recover DIR
+//   isorec export DIR
 
 func option(_ name: String) -> String? {
     guard let index = CommandLine.arguments.firstIndex(of: name), index + 1 < CommandLine.arguments.count else { return nil }
@@ -102,6 +103,12 @@ case "record":
     }
     print("session \(session.layout.sessionDirectory)")
     Thread.sleep(forTimeInterval: 0.2)
+    if let stagger = Double(option("--stagger") ?? "") {
+        for recorder in recorders {
+            recorder.startRecording()
+            Thread.sleep(forTimeInterval: stagger)
+        }
+    }
     session.startAll()
     let stoppedEarly = DispatchSemaphore(value: 0)
     session.onStoppedForDiskSpace = {
@@ -138,6 +145,14 @@ case "recover":
         fail("Could not recover: \(error)")
     }
 
+case "export":
+    guard CommandLine.arguments.count > 2 else { fail("export needs a session directory") }
+    do {
+        try SessionExport.write(directory: CommandLine.arguments[2]).forEach { print($0) }
+    } catch {
+        fail("Could not export: \(error)")
+    }
+
 default:
-    fail("usage: isorec record --root DIR [--inputs N] [--seconds S] | isorec recover DIR")
+    fail("usage: isorec record --root DIR [--inputs N] [--seconds S] | isorec recover DIR | isorec export DIR")
 }

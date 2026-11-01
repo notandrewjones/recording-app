@@ -651,3 +651,167 @@ import Testing
         #expect(EncoderCapacity.warnings(for: plan(1, codec)).count == 1)
     }
 }
+
+@Suite struct MulticamExportTests {
+    func segment(_ number: Int, file: String, tc: String, host: UInt64, frames: Int, format: VideoFormat = .hd1080p5994, state: SessionManifest.SegmentState = .finalized) -> SessionManifest.SegmentRecord {
+        var record = SessionManifest.SegmentRecord(number: number, workingFile: "\(file).part.mov", finalFile: "\(file).mov", indexFile: "i", logFile: "l", format: format, codec: .proResLT, audioChannels: 16, startTimecode: tc, timecodeIsEmbedded: false, startHostNanos: host)
+        record.frames = frames
+        record.state = state
+        return record
+    }
+
+    func manifest() -> SessionManifest {
+        var manifest = SessionManifest(name: "Game & Show", createdAt: Date(timeIntervalSince1970: 0), createdAtHostNanos: 0)
+        var a = SessionManifest.InputRecord(id: "a", label: "Cam 1")
+        a.segments = [segment(1, file: "Cam_1/Cam_1_0001", tc: "01:00:00;04", host: 1_000_000_000, frames: 600)]
+        var b = SessionManifest.InputRecord(id: "b", label: "Cam 2")
+        b.segments = [
+            segment(1, file: "Cam_2/Cam_2_0001", tc: "01:00:01;04", host: 2_001_000_000, frames: 300),
+            segment(2, file: "Cam_2/Cam_2_0002", tc: "01:00:10;04", host: 11_010_000_000, frames: 120, state: .finalizeFailed),
+        ]
+        manifest.inputs = [a, b]
+        return manifest
+    }
+
+    func plan() throws -> MulticamPlan {
+        try #require(MulticamPlan(manifest: manifest(), sessionDirectory: "/rec/My Session"))
+    }
+
+    @Test func positionsComeFromHostTime() throws {
+        let plan = try plan()
+        #expect(plan.angles[0].clips[0].offsetFrames == 0)
+        #expect(plan.angles[1].clips[0].offsetFrames == 60)
+        #expect(plan.angles[1].clips[1].offsetFrames == 600)
+        #expect(plan.startTimecode.string == "01:00:00;04")
+    }
+
+    @Test func unfinalizedSegmentsPointAtTheWorkingFile() throws {
+        #expect(try plan().angles[1].clips[1].fileName == "Cam_2_0002.part.mov")
+    }
+
+    @Test func totalCoversTheLastClip() throws {
+        #expect(try plan().totalFrames == 720)
+    }
+
+    @Test func emptySessionHasNoPlan() {
+        #expect(MulticamPlan(manifest: SessionManifest(name: "x", createdAt: Date(), createdAtHostNanos: 0), sessionDirectory: "/x") == nil)
+    }
+
+    @Test func sequenceFollowsTheMostCommonFormat() throws {
+        var manifest = manifest()
+        manifest.inputs[1].segments = [segment(1, file: "c", tc: "00:00:00:00", host: 1_000_000_000, frames: 5, format: VideoFormat(width: 1280, height: 720, frameRate: Rational(50, 1)))]
+        #expect(try #require(MulticamPlan(manifest: manifest, sessionDirectory: "/r")).format == .hd1080p5994)
+    }
+
+    @Test func mixedRatesScaleOntoTheTimeline() throws {
+        var manifest = manifest()
+        manifest.inputs[1].segments = [segment(1, file: "c", tc: "00:00:00:00", host: 1_000_000_000, frames: 100, format: VideoFormat(width: 1280, height: 720, frameRate: Rational(30000, 1001)))]
+        #expect(try #require(MulticamPlan(manifest: manifest, sessionDirectory: "/r")).angles[1].clips[0].timelineFrames == 200)
+    }
+
+    @Test func parsesTimecodeStrings() {
+        let rate = Rational(60000, 1001)
+        #expect(Timecode(string: "01:02:03;04", frameRate: rate)?.frameCount == 223_160)
+        #expect(Timecode(string: "01:02:03;04", frameRate: rate)?.isDropFrame == true)
+        #expect(Timecode(string: "garbage", frameRate: rate) == nil)
+    }
+
+    @Test func xmlIsEscapedAndWellFormed() throws {
+        let plan = try plan()
+        let fcpxml = MulticamExporter.fcpxml(plan)
+        #expect(fcpxml.contains("Game &amp; Show"))
+        #expect(fcpxml.contains("file:///rec/My%20Session/"))
+        _ = try XMLDocument(xmlString: fcpxml)
+        _ = try XMLDocument(xmlString: MulticamExporter.fcp7XML(plan))
+    }
+
+    @Test func fcp7PathsUseLocalhost() throws {
+        #expect(MulticamExporter.fcp7XML(try plan()).contains("file://localhost/rec/My%20Session/"))
+    }
+
+    @Test func edlLinesUpAgainstTheSequence() throws {
+        let plan = try plan()
+        let edl = MulticamExporter.edl(plan, angle: plan.angles[1])
+        #expect(edl.contains("FCM: DROP FRAME"))
+        #expect(edl.contains("001  CAM2     AV    C        01:00:01;04 01:00:06;04 01:00:01;04 01:00:06;04"))
+        #expect(edl.contains("* FROM CLIP NAME: Cam_2_0001.mov"))
+    }
+
+    @Test func oneFilePerToolAndAnEDLPerInput() throws {
+        let names = MulticamExporter.files(for: try plan()).map(\.name)
+        #expect(names.filter { $0.hasSuffix(".edl") }.count == 2)
+        #expect(names.contains { $0.hasSuffix(".fcpxml") })
+        #expect(names.contains { $0.hasSuffix(".xml") })
+        #expect(names.allSatisfy { !$0.contains("&") && !$0.contains(" ") })
+    }
+}
+
+@Suite struct ControlAPITests {
+    func request(_ method: String, _ path: String, headers: String = "Host: 127.0.0.1:9455\r\n", body: String = "") -> ControlRequest? {
+        let length = body.isEmpty ? "" : "Content-Length: \(body.utf8.count)\r\n"
+        let raw = "\(method) \(path) HTTP/1.1\r\n\(headers)\(length)\r\n\(body)"
+        if case .request(let parsed) = ControlRequest.parse(Data(raw.utf8)) { return parsed }
+        return nil
+    }
+
+    func route(_ method: String, _ path: String, headers: String = "Host: 127.0.0.1:9455\r\n", body: String = "") throws -> ControlRouter.Result {
+        ControlRouter.route(try #require(request(method, path, headers: headers, body: body)))
+    }
+
+    @Test func routesCommands() throws {
+        #expect(try route("GET", "/api/v1/status") == .command(.status))
+        #expect(try route("POST", "/api/v1/record/start") == .command(.startRecording))
+        #expect(try route("POST", "/api/v1/record/stop") == .command(.stopRecording))
+        #expect(try route("POST", "/api/v1/inputs/cam%201/arm") == .command(.setArmed(inputID: "cam 1", armed: true)))
+        #expect(try route("POST", "/api/v1/inputs/cam1/disarm") == .command(.setArmed(inputID: "cam1", armed: false)))
+    }
+
+    @Test func markerReadsItsLabel() throws {
+        #expect(try route("POST", "/api/v1/marker", body: "{\"label\":\"Goal\"}") == .command(.addMarker(label: "Goal")))
+        #expect(try route("POST", "/api/v1/marker") == .command(.addMarker(label: "Marker")))
+        #expect(try route("POST", "/api/v1/marker", body: "not json") == .command(.addMarker(label: "Marker")))
+    }
+
+    func status(_ result: ControlRouter.Result) -> Int? {
+        if case .rejected(let response) = result { return response.status }
+        return nil
+    }
+
+    @Test func browsersAreRefused() throws {
+        #expect(status(try route("POST", "/api/v1/record/stop", headers: "Host: 127.0.0.1:9455\r\nOrigin: https://evil.example\r\n")) == 403)
+    }
+
+    @Test func dnsRebindingIsRefused() throws {
+        #expect(status(try route("POST", "/api/v1/record/stop", headers: "Host: evil.example\r\n")) == 403)
+        #expect(status(try route("POST", "/api/v1/record/stop", headers: "")) == 403)
+    }
+
+    @Test func acceptsEveryLoopbackHostForm() throws {
+        for host in ["localhost:9455", "127.0.0.1", "[::1]:9455"] {
+            #expect(try route("GET", "/api/v1/status", headers: "Host: \(host)\r\n") == .command(.status))
+        }
+    }
+
+    @Test func wrongMethodAndUnknownPaths() throws {
+        #expect(status(try route("GET", "/api/v1/record/stop")) == 405)
+        #expect(status(try route("POST", "/nope")) == 404)
+    }
+
+    @Test func parserWaitsForTheWholeBody() {
+        let raw = "POST /api/v1/marker HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc"
+        #expect(ControlRequest.parse(Data(raw.utf8)) == .incomplete)
+        #expect(ControlRequest.parse(Data("GET /a".utf8)) == .incomplete)
+    }
+
+    @Test func parserRejectsGarbageAndOversizedRequests() {
+        #expect(ControlRequest.parse(Data("nonsense\r\n\r\n".utf8)) == .invalid)
+        #expect(ControlRequest.parse(Data(repeating: 65, count: ControlRequest.maximumSize + 1)) == .invalid)
+        #expect(ControlRequest.parse(Data("GET / HTTP/1.1\r\nContent-Length: nope\r\n\r\n".utf8)) == .invalid)
+    }
+
+    @Test func responsesAreValidHTTP() {
+        let text = String(decoding: ControlResponse(status: 404, error: "x").serialized, as: UTF8.self)
+        #expect(text.hasPrefix("HTTP/1.1 404 Not Found\r\n"))
+        #expect(text.contains("Connection: close"))
+    }
+}

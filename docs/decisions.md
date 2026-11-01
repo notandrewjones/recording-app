@@ -174,3 +174,20 @@ q=75, so the UI offers a bitrate cap and warns without one. There is no storage 
 
 Without it, five HEVC streams at CBR repeated frames. With it, they recorded clean. The cost in compression
 efficiency has not been measured. B-frames are off, so frame order matches capture order for replay.
+
+## Exports are placed by host time
+
+Free-running sources can carry unrelated timecode, so position on the timeline comes from host time and
+each clip keeps its own source timecode. The most common format sets the sequence, and other rates are
+scaled to it. Segments that could not be finalized point at their working file.
+
+## A multicam in FCPXML, aligned tracks in FCP7 XML
+
+FCPXML can express a real multicam, and output is validated against Apple's own 1.11 DTD. FCP7 XML has no
+dependable multicam form, so Premiere gets aligned tracks. A CMX EDL has one video track, hence one per input.
+
+## The control API is local HTTP
+
+Companion's generic HTTP module can drive it with no custom module. A local server is reachable from any web
+page, so it binds to loopback and refuses `Origin` headers and non-local `Host` values. WebSocket and OSC can
+be added later without changing the commands.
