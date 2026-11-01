@@ -1,16 +1,44 @@
+import AppKit
 import ISOCore
 import ISOEngine
 import SwiftUI
 
+/// Warns before quitting while segments are open. Recovery would finish them on the next launch, but
+/// the operator should choose that knowingly, particularly if the drive is about to be unplugged.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    var hasOpenSegments: () -> Bool = { false }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard hasOpenSegments() else { return .terminateNow }
+        let alert = NSAlert()
+        alert.messageText = "Recordings are still being saved"
+        alert.informativeText = "If you quit now, they will be finished the next time ISO Recorder opens. Keep the drive connected until then."
+        alert.addButton(withTitle: "Keep Saving")
+        alert.addButton(withTitle: "Quit Anyway")
+        return alert.runModal() == .alertFirstButtonReturn ? .terminateCancel : .terminateNow
+    }
+}
+
 @main
 struct ISORecorderApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var model = AppModel()
 
+    init() {
+        // After a crash or kill, restoration brought the app back with no window at all, which is
+        // the worst moment to lose the multiview. This app always opens its one window fresh.
+        UserDefaults.standard.register(defaults: ["ApplePersistenceIgnoreState": true])
+    }
+
     var body: some Scene {
-        WindowGroup("ISO Recorder") {
+        Window("ISO Recorder", id: "multiview") {
             MultiviewScreen(model: model)
                 .frame(minWidth: 960, minHeight: 600)
                 .preferredColorScheme(.dark)
+                .onAppear {
+                    let model = model
+                    delegate.hasOpenSegments = { model.isRecording || model.isFinalizing }
+                }
         }
         .windowStyle(.hiddenTitleBar)
         .commands {
@@ -148,19 +176,49 @@ struct InputTileView: View {
     private var footer: some View {
         HStack {
             Text(tile.status.timecode?.string ?? "--:--:--:--")
-            Spacer()
+                .fixedSize()
+            Spacer(minLength: 8)
             if let recorder = tile.recorderStatus, tile.isRecording {
+                LoadBar(fill: recorder.ringFill)
                 Text(recorderSummary(recorder))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            } else {
+                Text(String(format: "%.2f fps", tile.measuredFPS))
+                    .fixedSize()
             }
-            Text(String(format: "%.2f fps", tile.measuredFPS))
         }
         .modifier(TileStrip())
+    }
+}
+
+/// How much of the input's ring is in use. It stays near empty until the encoder falls behind.
+private struct LoadBar: View {
+    let fill: Double
+
+    private var color: Color {
+        switch InputLoad(ringFill: fill) {
+        case .healthy: Palette.locked
+        case .strained: Palette.warning
+        case .overloaded: Palette.tally
+        }
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .leading) {
+                Palette.line
+                color.frame(width: geometry.size.width * max(0.02, min(fill, 1)))
+            }
+        }
+        .frame(width: 44, height: 6)
     }
 }
 
 private func recorderSummary(_ status: InputRecorderStatus) -> String {
     var parts = ["seg \(status.segment ?? 0)", "\(status.totalFrames) f"]
     if status.repeatedFrames > 0 { parts.append("\(status.repeatedFrames) rpt") }
+    if status.gapFrames > 0 { parts.append("\(status.gapFrames) gap") }
     if status.restarts > 0 { parts.append("\(status.restarts) restart\(status.restarts == 1 ? "" : "s")") }
     return parts.joined(separator: " · ")
 }
@@ -190,12 +248,39 @@ struct StatusBar: View {
                 Text(message).lineLimit(1)
             }
             Spacer()
-            Text(model.driverStatus)
+            if let sample = model.systemSample {
+                Text(String(format: "CPU %.0f%%", sample.cpuUsage * 100))
+                    .foregroundStyle(sample.cpuUsage > 0.85 ? Palette.warning : Palette.secondary)
+                Text(memoryText(sample))
+                    .foregroundStyle(sample.memoryPressure == .critical ? Palette.tally : Palette.secondary)
+            }
+            if model.writeBytesPerSecond > 0 {
+                Text(String(format: "%.0f MB/s", model.writeBytesPerSecond / 1_000_000))
+            }
+            Text(diskText).foregroundStyle(diskColor)
+            Text(model.driverStatus).lineLimit(1)
         }
         .font(.system(size: 11, design: .monospaced))
         .foregroundStyle(Palette.secondary)
         .padding(.horizontal, 10)
         .frame(height: 24)
         .overlay(alignment: .top) { Palette.line.frame(height: 1) }
+    }
+
+    private func memoryText(_ sample: SystemMetrics.Sample) -> String {
+        let used = Double(sample.memoryUsedBytes) / 1_073_741_824
+        let total = Double(sample.memoryTotalBytes) / 1_073_741_824
+        return String(format: "MEM %.0f/%.0f GB", used, total)
+    }
+
+    private var diskText: String {
+        let free = String(format: "%.0f GB free", Double(model.freeBytes) / 1_000_000_000)
+        guard let remaining = model.remainingSeconds else { return free }
+        return "\(free) · \(remaining.durationDescription) left"
+    }
+
+    private var diskColor: Color {
+        if case .low = model.storageLevel { return Palette.warning }
+        return Palette.secondary
     }
 }

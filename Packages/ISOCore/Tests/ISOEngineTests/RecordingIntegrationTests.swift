@@ -80,6 +80,7 @@ import Testing
         #expect(info.videoFrames > 100)
         #expect(info.videoFrames == records.count)
         #expect(info.videoFrames == harness.recorder.status().totalFrames)
+        #expect(segment.lostFrames == 0)
         #expect(records.map(\.frameNumber) == (0..<UInt64(records.count)).map { $0 })
         #expect(info.audioChannels == 16)
         #expect(info.codecName == "prores")
@@ -205,6 +206,11 @@ import Testing
         #expect(segments.allSatisfy { $0.state == .finalized })
         #expect(harness.recorder.status().restarts == 1)
 
+        // The index is trimmed to match, so frame N is still record N in the crashed segment.
+        for segment in segments {
+            #expect(harness.indexRecords(segment).count == segment.frames)
+        }
+
         // Segment 1 keeps everything up to about the last fragment, and the gap is bounded.
         let total = segments.map(\.frames).reduce(0, +)
         #expect(total > 280)
@@ -285,5 +291,126 @@ import Testing
             // About 4.5 s was recording, so at most a little over one fragment is lost.
             #expect(segment.frames > 220)
         }
+    }
+
+    @Test func oneInputFailingLeavesTheOthersUntouched() throws {
+        let root = (NSTemporaryDirectory() as NSString).appendingPathComponent("isorec-iso-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let session = try RecordingSession(rootPath: root, name: "iso", environment: environment)
+        let settings = InputRecorderSettings(stallSeconds: 1, fullSyncSeconds: 0)
+
+        var sources: [SyntheticSource] = []
+        var recorders: [InputRecorder] = []
+        for index in 1...4 {
+            let recorder = session.addInput(id: "cam\(index)", label: "Cam \(index)", settings: settings)
+            let source = SyntheticSource()
+            source.onFrame = { recorder.ingest($0) }
+            source.start(frames: 420)
+            sources.append(source)
+            recorders.append(recorder)
+        }
+        Thread.sleep(forTimeInterval: 0.1)
+        session.startAll()
+        Thread.sleep(forTimeInterval: 2)
+
+        // One recorder is killed outright and another hangs. Both must recover alone.
+        let killed = try #require(recorders[0].status().ffmpegProcessIdentifier)
+        let hung = try #require(recorders[1].status().ffmpegProcessIdentifier)
+        #expect(kill(killed, SIGKILL) == 0)
+        #expect(kill(hung, SIGSTOP) == 0)
+
+        sources.forEach { $0.waitUntilFinished() }
+        Thread.sleep(forTimeInterval: 0.2)
+        session.stopAll()
+        session.waitUntilFinished()
+
+        let inputs = session.store.snapshot.inputs
+        #expect(inputs[0].segments.count >= 2)
+        #expect(inputs[1].segments.count >= 2)
+        for index in 2...3 {
+            #expect(inputs[index].segments.count == 1)
+            #expect(inputs[index].segments.first?.repeatedFrames == 0)
+            #expect(recorders[index].status().restarts == 0)
+            #expect(inputs[index].segments.first?.state == .finalized)
+        }
+        let failed = try #require(inputs[0].segments.first)
+        #expect(failed.lostFrames > 0)
+        #expect(failed.lostFrames < 60)
+    }
+
+    @Test func mixedFormatsRecordSideBySide() throws {
+        let root = (NSTemporaryDirectory() as NSString).appendingPathComponent("isorec-mix-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let session = try RecordingSession(rootPath: root, name: "mix", environment: environment)
+        let formats: [VideoFormat] = [
+            .hd1080p5994,
+            .hd1080i5994,
+            VideoFormat(width: 1280, height: 720, frameRate: Rational(50, 1)),
+            VideoFormat(width: 1920, height: 1080, frameRate: Rational(24000, 1001)),
+        ]
+        var sources: [SyntheticSource] = []
+        for (index, format) in formats.enumerated() {
+            let settings = InputRecorderSettings(fullSyncSeconds: 0)
+            let recorder = session.addInput(id: "cam\(index)", label: "Cam \(index)", settings: settings)
+            let source = SyntheticSource(format: format)
+            source.onFrame = { recorder.ingest($0) }
+            source.start()
+            sources.append(source)
+        }
+        Thread.sleep(forTimeInterval: 0.2)
+        session.startAll()
+        Thread.sleep(forTimeInterval: 2.5)
+        session.stopAll()
+        sources.forEach { $0.cancel() }
+        session.waitUntilFinished()
+
+        let inputs = session.store.snapshot.inputs
+        for (index, format) in formats.enumerated() {
+            let segment = try #require(inputs[index].segments.first)
+            let info = try MediaProbe.info(session.layout.absolutePath(segment.finalFile), environment: environment)
+            #expect(info.width == format.width)
+            #expect(info.videoFrames == segment.frames)
+            #expect(segment.repeatedFrames == 0)
+            if format.scan.isInterlaced { #expect(info.fieldOrder != "progressive") } else { #expect(info.fieldOrder == "progressive") }
+        }
+    }
+
+    @Test func driveFillingStopsCleanlyAndKeepsTheFootage() throws {
+        let image = (NSTemporaryDirectory() as NSString).appendingPathComponent("isorec-\(UUID().uuidString).dmg")
+        let create = try ProcessRunner.run("/usr/bin/hdiutil", ["create", "-size", "400m", "-fs", "APFS", "-volname", "ISORecTest", "-ov", image])
+        try #require(create.status == 0, "\(create.output)")
+        defer { try? FileManager.default.removeItem(atPath: image) }
+        let attach = try ProcessRunner.run("/usr/bin/hdiutil", ["attach", "-nobrowse", image])
+        try #require(attach.status == 0, "\(attach.output)")
+        let mount = try #require(attach.output.split(separator: "\n").last?.split(separator: "\t").last.map { String($0).trimmingCharacters(in: .whitespaces) })
+        defer { _ = try? ProcessRunner.run("/usr/bin/hdiutil", ["detach", "-force", mount]) }
+
+        let policy = StoragePolicy(criticalFreeBytes: 120 * 1_048_576)
+        let session = try RecordingSession(rootPath: mount, name: "full", environment: environment, storagePolicy: policy)
+        let stopped = DispatchSemaphore(value: 0)
+        session.onStoppedForDiskSpace = { stopped.signal() }
+        let recorder = session.addInput(id: "cam", label: "Cam", settings: InputRecorderSettings(fullSyncSeconds: 0))
+        let pool = SyntheticFramePool(format: .hd1080p5994, count: 8)
+        let source = SyntheticSource(pool: pool)
+        source.onFrame = { recorder.ingest($0) }
+        source.start()
+        Thread.sleep(forTimeInterval: 0.1)
+        session.startAll()
+
+        #expect(stopped.wait(timeout: .now() + 30) == .success)
+        source.cancel()
+        session.waitUntilFinished()
+
+        let segment = try #require(session.store.snapshot.inputs.first?.segments.first)
+        #expect(segment.endReason == .diskFull)
+        #expect(segment.frames > 100)
+        // With no room for the copy, the working file is kept rather than risking it.
+        let working = session.layout.absolutePath(segment.workingFile)
+        let final = session.layout.absolutePath(segment.finalFile)
+        #expect(FileManager.default.fileExists(atPath: working) || FileManager.default.fileExists(atPath: final))
+        let survivor = FileManager.default.fileExists(atPath: final) ? final : working
+        #expect(try MediaProbe.videoFrameCount(survivor, environment: environment) == segment.frames)
     }
 }

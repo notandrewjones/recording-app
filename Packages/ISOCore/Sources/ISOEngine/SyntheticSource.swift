@@ -19,6 +19,7 @@ public final class SyntheticSource: @unchecked Sendable {
     private let faults: [UInt64: Fault]
     private let timecodeStart: Timecode?
     private let realtime: Bool
+    private let pool: SyntheticFramePool?
     private let lock = UnfairLock()
     private var cancelled = false
     private var thread: Thread?
@@ -28,12 +29,13 @@ public final class SyntheticSource: @unchecked Sendable {
     public var onFrame: ((IngestFrame) -> Void)?
 
     /// - Parameter faults: keyed by delivered frame number.
-    public init(format: VideoFormat = .hd1080p5994, audioChannels: Int = 16, timecodeStart: Timecode? = nil, faults: [UInt64: Fault] = [:], realtime: Bool = true) {
+    public init(format: VideoFormat = .hd1080p5994, audioChannels: Int = 16, timecodeStart: Timecode? = nil, faults: [UInt64: Fault] = [:], realtime: Bool = true, pool: SyntheticFramePool? = nil) {
         self.format = format
         self.audioChannels = audioChannels
         self.timecodeStart = timecodeStart
         self.faults = faults
         self.realtime = realtime
+        self.pool = pool
     }
 
     public func start(frames limit: UInt64 = .max) {
@@ -88,7 +90,13 @@ public final class SyntheticSource: @unchecked Sendable {
                 }
             }
 
-            SyntheticFrame.fill(buffer, format: format, frameNumber: delivered)
+            let video: UnsafeRawPointer
+            if let pool, pool.format == format {
+                video = pool.frame(delivered)
+            } else {
+                SyntheticFrame.fill(buffer, format: format, frameNumber: delivered)
+                video = UnsafeRawPointer(buffer.baseAddress!)
+            }
             let samples = AudioCadence.sampleCount(forFrame: cadenceFrame, frameRate: format.frameRate)
             if audioChannels > 0 {
                 Self.fillTone(audio, samples: samples, channels: audioChannels, phase: &samplePhase)
@@ -96,7 +104,7 @@ public final class SyntheticSource: @unchecked Sendable {
 
             let frame = IngestFrame(
                 format: format,
-                video: UnsafeRawPointer(buffer.baseAddress!),
+                video: video,
                 audio: audioChannels > 0 ? UnsafeRawPointer(audio) : nil,
                 audioSampleFrames: audioChannels > 0 ? samples : 0,
                 hostTimeNanos: DispatchTime.now().uptimeNanoseconds,

@@ -26,18 +26,36 @@ Constraints found in testing:
 
 ## Capacity on the M2 Pro
 
+Full recording path: 16-channel audio, ProRes HQ, grain-heavy synthetic frames, 16 GB of RAM with other
+apps open. Runs were 25 s unless noted. Repeated frames are the ones that matter.
+
+| 1080p59.94 inputs | Repeated | Peak ring | Peak CPU |
+|---|---|---|---|
+| 5, in the app with preview, 60 s | 0 | Load bars near empty | 60% at sample |
+| 6 | 0 | 26% | 76% |
+| 7 | 0 | 60% | 94% |
+| 8 | 0 | 91% | 100% |
+
+8 is the edge, not a working number. Plan on 5 or 6 until a soak test says otherwise.
+
+Raw transport benchmarks, without audio or the ring:
+
 | Load | Result |
 |---|---|
-| ProRes HQ 1080p59.94 × 4 | Clean |
-| × 8 | Held 60 fps, about 5% of frames briefly late, worst write 59 ms |
-| × 10 | Failed at 53.5 fps |
 | ProRes HQ 2160p59.94 × 1 | Clean |
 | × 2 | 104 of 958 late, startup not separated |
 | HEVC 50 Mb/s 1080p59.94 × 4 | Clean |
 | H.264 50 Mb/s 1080p59.94 × 4 | Failed, 1353 of 1916 late, cause not investigated |
 | `prores_ks` HQ 1080p59.94 × 1 | Failed, 414 of 479 late, about 11 cores |
 
-Each ffmpeg used 412–718 MB. At 12 streams the machine ran out of memory headroom before anything else.
+Each ffmpeg holds about 450–950 MB, which is not its own frame queue, since shrinking that changed nothing.
+The likely source is VideoToolbox. Memory pressure stayed at warning throughout.
+
+## One decoder thread per ffmpeg
+
+The default v210 frame threading was the difference between collapsing at 6 inputs and holding 8. At 5
+inputs it took peak CPU from 79% to 49%. Shrinking `-thread_queue_size` to 2 made things worse, so it stays
+at the default.
 
 ## Software ProRes is opt-in
 
@@ -88,3 +106,25 @@ held in memory at the crash is lost, which is bounded by its queue and the last 
 A closed segment temporarily takes twice its size during the remux. The frame count of the result must
 match the working file first. This matters on a small drive, so a segment with too little room for
 the copy stays as a working file rather than risking the recording.
+
+## Lost frames are measured per segment
+
+A killed ffmpeg loses frames it had read but not flushed, which the ring cannot see. On finalize, each
+segment compares index records with frames in the file, stores the difference as `lostFrames`, and trims
+the index so frame N still equals record N. It should be 0 except after a crash.
+
+## Recording stops itself before the drive fills
+
+A completely full drive would fail every input at once, mid-fragment. Instead the session stops all
+inputs at 2 GB free and warns when under 10 minutes remain. With too little room to finalize, working
+files stay in place, and they are complete and playable. This is tested on a real, small disk image.
+
+## Profile changes rebuild the input list
+
+A Duo 2 profile change alters which connectors are inputs. One change notifies every sub-device, so
+notifications are coalesced into one rebuild after 0.5 s. This is compiled but untested without hardware.
+
+## The app never restores window state
+
+After a crash or kill, macOS restoration brought the app back with no window. A recorder relaunched
+mid-show has to show the multiview, so restoration is off and the app uses a single `Window` scene.

@@ -33,6 +33,8 @@ final class SegmentRecorder: @unchecked Sendable {
         var neverStarted: Bool
         /// Every queued frame reached ffmpeg, so this was a clean end rather than a failure.
         var drained: Bool
+        /// Host time of the last frame written, used to measure the gap to the next segment.
+        var lastHostNanos: UInt64 = 0
     }
 
     let configuration: Configuration
@@ -47,6 +49,7 @@ final class SegmentRecorder: @unchecked Sendable {
     private var aborted = false
     private var framesWritten = 0
     private var repeatedFrames = 0
+    private var lastHostNanos: UInt64 = 0
 
     private var isAborted: Bool { lock.withLock { aborted } }
 
@@ -129,7 +132,7 @@ final class SegmentRecorder: @unchecked Sendable {
         unlink(configuration.videoSocketPath)
         unlink(configuration.audioSocketPath)
         let totals = counters
-        onFinished?(Outcome(framesWritten: totals.frames, repeatedFrames: totals.repeated, exitCode: exitCode, neverStarted: false, drained: drained))
+        onFinished?(Outcome(framesWritten: totals.frames, repeatedFrames: totals.repeated, exitCode: exitCode, neverStarted: false, drained: drained, lastHostNanos: lock.withLock { lastHostNanos }))
     }
 
     private func waitForFirstFrame() -> FrameRing.Entry? {
@@ -200,6 +203,7 @@ final class SegmentRecorder: @unchecked Sendable {
             ordinal += 1
             lock.withLock {
                 framesWritten += 1
+                lastHostNanos = metadata.hostTimeNanos
                 if repeated { repeatedFrames += 1 }
             }
             return true

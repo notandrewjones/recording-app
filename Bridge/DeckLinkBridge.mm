@@ -224,9 +224,45 @@ private:
 
 @end
 
+class DLProfileCallback final : public IDeckLinkProfileCallback {
+public:
+    explicit DLProfileCallback(void (^activated)(void)) : activated_(activated) {}
+
+    HRESULT QueryInterface(REFIID, LPVOID *ppv) override {
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG AddRef() override { return ++refCount_; }
+    ULONG Release() override {
+        ULONG count = --refCount_;
+        if (count == 0) delete this;
+        return count;
+    }
+
+    HRESULT ProfileChanging(IDeckLinkProfile *, bool) override { return S_OK; }
+    HRESULT ProfileActivated(IDeckLinkProfile *) override {
+        activated_();
+        return S_OK;
+    }
+
+private:
+    std::atomic<ULONG> refCount_{1};
+    void (^activated_)(void);
+};
+
 class DLDiscoveryCallback final : public IDeckLinkDeviceNotificationCallback {
 public:
-    DLDiscoveryCallback(void (^arrived)(DLInput *), void (^removed)(DLInput *)) : arrived_(arrived), removed_(removed) {}
+    DLDiscoveryCallback(void (^arrived)(DLInput *), void (^removed)(DLInput *), void (^profileChanged)(void))
+        : arrived_(arrived), removed_(removed), profileCallback_(new DLProfileCallback(profileChanged)) {}
+
+    ~DLDiscoveryCallback() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto &entry : managers_) {
+            entry.second->SetCallback(nullptr);
+            entry.second->Release();
+        }
+        profileCallback_->Release();
+    }
 
     HRESULT QueryInterface(REFIID, LPVOID *ppv) override {
         *ppv = nullptr;
@@ -240,6 +276,7 @@ public:
     }
 
     HRESULT DeckLinkDeviceArrived(IDeckLink *deckLink) override {
+        watchProfiles(deckLink);
         DLInput *input = [[DLInput alloc] initWithDeckLink:deckLink];
         if (input == nil) return S_OK;
         {
@@ -254,6 +291,12 @@ public:
         DLInput *input = nil;
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            auto manager = managers_.find(deckLink);
+            if (manager != managers_.end()) {
+                manager->second->SetCallback(nullptr);
+                manager->second->Release();
+                managers_.erase(manager);
+            }
             auto found = inputs_.find(deckLink);
             if (found == inputs_.end()) return S_OK;
             input = found->second;
@@ -264,11 +307,22 @@ public:
     }
 
 private:
+    /// Watches every device, including ones with no active input, since a profile change can add inputs.
+    void watchProfiles(IDeckLink *deckLink) {
+        IDeckLinkProfileManager *manager = nullptr;
+        if (deckLink->QueryInterface(IID_IDeckLinkProfileManager, (void **)&manager) != S_OK) return;
+        manager->SetCallback(profileCallback_);
+        std::lock_guard<std::mutex> lock(mutex_);
+        managers_[deckLink] = manager;
+    }
+
     std::atomic<ULONG> refCount_{1};
     std::mutex mutex_;
     std::map<IDeckLink *, DLInput *> inputs_;
+    std::map<IDeckLink *, IDeckLinkProfileManager *> managers_;
     void (^arrived_)(DLInput *);
     void (^removed_)(DLInput *);
+    DLProfileCallback *profileCallback_;
 };
 
 @implementation DLDiscovery {
@@ -289,11 +343,13 @@ private:
     return @BLACKMAGIC_DECKLINK_API_VERSION_STRING;
 }
 
-- (BOOL)startWithArrived:(void (^)(DLInput *))arrived removed:(void (^)(DLInput *))removed {
+- (BOOL)startWithArrived:(void (^)(DLInput *))arrived
+                 removed:(void (^)(DLInput *))removed
+          profileChanged:(void (^)(void))profileChanged {
     [self stop];
     _discovery = CreateDeckLinkDiscoveryInstance();
     if (_discovery == nullptr) return NO;
-    _callback = new DLDiscoveryCallback(arrived, removed);
+    _callback = new DLDiscoveryCallback(arrived, removed, profileChanged);
     if (_discovery->InstallDeviceNotifications(_callback) != S_OK) {
         [self stop];
         return NO;

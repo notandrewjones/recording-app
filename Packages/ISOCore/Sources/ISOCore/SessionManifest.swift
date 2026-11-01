@@ -44,6 +44,7 @@ public struct SessionManifest: Codable, Hashable, Sendable {
         case discontinuity
         case recorderFailed
         case appInterrupted
+        case diskFull
     }
 
     public struct SegmentRecord: Codable, Hashable, Sendable {
@@ -60,6 +61,8 @@ public struct SessionManifest: Codable, Hashable, Sendable {
         public var startHostNanos: UInt64
         public var frames: Int = 0
         public var repeatedFrames: Int = 0
+        /// Frames handed to ffmpeg that never reached the file, which is only non-zero after a crash.
+        public var lostFrames: Int = 0
         public var state: SegmentState = .recording
         public var endReason: EndReason?
 

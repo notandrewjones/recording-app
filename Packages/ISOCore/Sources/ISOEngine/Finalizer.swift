@@ -37,10 +37,18 @@ public final class Finalizer: @unchecked Sendable {
 
         var state = SessionManifest.SegmentState.finalizeFailed
         var frames = segment.frames
-        defer { store.updateSegment(inputID: inputID, number: number) { $0.state = state; $0.frames = frames } }
+        var lost = 0
+        defer {
+            store.updateSegment(inputID: inputID, number: number) {
+                $0.state = state
+                $0.frames = frames
+                $0.lostFrames = lost
+            }
+        }
 
         guard let expected = try? MediaProbe.videoFrameCount(working, environment: environment), expected > 0 else { return }
         frames = expected
+        lost = trimIndex(store.layout.absolutePath(segment.indexFile), toFrames: expected)
         guard hasRoom(forCopyOf: working, near: final) else { return }
 
         let arguments = FFmpegCommand.finalizeArguments(input: working, output: final, startTimecode: segment.startTimecode)
@@ -52,6 +60,17 @@ public final class Finalizer: @unchecked Sendable {
         }
         unlink(working)
         state = .finalized
+    }
+
+    /// After a crash the index runs ahead of the media by whatever ffmpeg never flushed. Trimming it
+    /// keeps file frame N equal to record N. Returns how many records were removed.
+    private func trimIndex(_ path: String, toFrames frames: Int) -> Int {
+        var info = stat()
+        guard stat(path, &info) == 0 else { return 0 }
+        let records = (Int(info.st_size) - FrameIndexFile.headerSize) / FrameIndexFile.recordSize
+        guard records > frames else { return 0 }
+        truncate(path, off_t(FrameIndexFile.headerSize + frames * FrameIndexFile.recordSize))
+        return records - frames
     }
 
     private func hasRoom(forCopyOf path: String, near destination: String) -> Bool {

@@ -4,7 +4,8 @@ import ISOEngine
 
 // Headless recorder for testing the engine with synthetic sources.
 //
-//   isorec record --root DIR [--name NAME] [--inputs N] [--seconds S] [--codec hq|lt|422|proxy|4444] [--no-audio]
+//   isorec record --root DIR [--name NAME] [--inputs N] [--seconds S] [--codec hq|lt|422|proxy|4444]
+//                 [--no-audio] [--grain] [--min-free-mb MB]
 //   isorec recover DIR
 
 func option(_ name: String) -> String? {
@@ -49,16 +50,19 @@ case "record":
 
     let session: RecordingSession
     do {
-        session = try RecordingSession(rootPath: root, name: option("--name"), environment: environment)
+        var policy = StoragePolicy()
+        if let megabytes = Int64(option("--min-free-mb") ?? "") { policy.criticalFreeBytes = megabytes * 1_048_576 }
+        session = try RecordingSession(rootPath: root, name: option("--name"), environment: environment, storagePolicy: policy)
     } catch {
         fail("Could not create session: \(error)")
     }
 
+    let pool = flag("--grain") ? SyntheticFramePool(format: .hd1080p5994) : nil
     var sources: [SyntheticSource] = []
     var recorders: [InputRecorder] = []
     for index in 1...inputCount {
         let recorder = session.addInput(id: "synthetic-\(index)", label: "Cam \(index)", settings: settings)
-        let source = SyntheticSource(audioChannels: audioChannels)
+        let source = SyntheticSource(audioChannels: audioChannels, pool: pool)
         source.onFrame = { recorder.ingest($0) }
         source.start()
         sources.append(source)
@@ -67,14 +71,31 @@ case "record":
     print("session \(session.layout.sessionDirectory)")
     Thread.sleep(forTimeInterval: 0.2)
     session.startAll()
-    Thread.sleep(forTimeInterval: seconds)
+    let stoppedEarly = DispatchSemaphore(value: 0)
+    session.onStoppedForDiskSpace = {
+        print("stopped: drive nearly full")
+        stoppedEarly.signal()
+    }
+    let metrics = SystemMetrics()
+    _ = metrics.sample()
+    var peakCPU = 0.0
+    var worstPressure = MemoryPressure.normal
+    let deadline = Date().addingTimeInterval(seconds)
+    while Date() < deadline {
+        if stoppedEarly.wait(timeout: .now() + 1) == .success { break }
+        let sample = metrics.sample()
+        peakCPU = max(peakCPU, sample.cpuUsage)
+        if sample.memoryPressure.rawValue > worstPressure.rawValue { worstPressure = sample.memoryPressure }
+    }
+    let liveRate = session.health.writeBytesPerSecond
     session.stopAll()
     sources.forEach { $0.cancel() }
     session.waitUntilFinished()
     for recorder in recorders {
         let status = recorder.status()
-        print("\(recorder.label): frames=\(status.totalFrames) repeated=\(status.repeatedFrames) restarts=\(status.restarts)")
+        print("\(recorder.label): frames=\(status.totalFrames) repeated=\(status.repeatedFrames) restarts=\(status.restarts) gap=\(status.gapFrames) peakRing=\(Int(status.peakRingFill * 100))%")
     }
+    print(String(format: "machine: peakCPU=%.0f%% memoryPressure=%@ write=%.0f MB/s", peakCPU * 100, String(describing: worstPressure), liveRate / 1_000_000))
 
 case "recover":
     guard CommandLine.arguments.count > 2 else { fail("recover needs a session directory") }

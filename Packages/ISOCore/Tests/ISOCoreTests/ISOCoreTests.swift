@@ -123,6 +123,12 @@ import Testing
         #expect(!args.contains { $0.contains("nobuffer") })
     }
 
+    @Test func decoderStaysSingleThreaded() throws {
+        let args = try FFmpegCommand.recordArguments(config(audio: nil))
+        #expect(value(after: "-threads", in: args) == "1")
+        #expect(args.firstIndex(of: "-threads")! < args.firstIndex(of: "-i")!)
+    }
+
     @Test func probeFlagsPrecedeTheirInput() throws {
         let args = try FFmpegCommand.recordArguments(config(audio: nil))
         #expect(args.firstIndex(of: "-probesize")! < args.firstIndex(of: "-i")!)
@@ -463,5 +469,35 @@ import Testing
         let relative = layout.relativePath("/rec/S/Cam/Cam_0001.mov")
         #expect(relative == "Cam/Cam_0001.mov")
         #expect(layout.absolutePath(relative) == "/rec/S/Cam/Cam_0001.mov")
+    }
+}
+
+@Suite struct StoragePolicyTests {
+    let policy = StoragePolicy(warningSeconds: 600, criticalFreeBytes: 1000)
+
+    @Test func stopsAtTheFloorEvenWhenIdle() {
+        #expect(policy.evaluate(freeBytes: 1000, writeBytesPerSecond: 0) == .critical)
+    }
+
+    @Test func warnsWithTimeRemaining() {
+        #expect(policy.evaluate(freeBytes: 2000, writeBytesPerSecond: 10) == .low(secondsRemaining: 100))
+    }
+
+    @Test func plentyOfRoomIsFine() {
+        #expect(policy.evaluate(freeBytes: 10_000_000, writeBytesPerSecond: 10) == .ok)
+        #expect(policy.evaluate(freeBytes: 2000, writeBytesPerSecond: 0) == .ok)
+    }
+}
+
+@Suite struct InputLoadTests {
+    @Test func thresholds() {
+        #expect(InputLoad(ringFill: 0.1) == .healthy)
+        #expect(InputLoad(ringFill: 0.6) == .strained)
+        #expect(InputLoad(ringFill: 0.95) == .overloaded)
+    }
+
+    @Test func durationText() {
+        #expect((3900.0).durationDescription == "1h 05m")
+        #expect((750.0).durationDescription == "12m 30s")
     }
 }

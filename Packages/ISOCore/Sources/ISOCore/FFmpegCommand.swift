@@ -109,7 +109,8 @@ public enum FFmpegCommand {
     }
 
     private static func videoInputArguments(_ format: VideoFormat) -> [String] {
-        let size = ["-video_size", "\(format.width)x\(format.height)", "-framerate", format.frameRate.ffmpegString]
+        // One decoder thread: unpacking v210 is cheap, and the default frame threading doubled system load.
+        let size = ["-threads", "1", "-video_size", "\(format.width)x\(format.height)", "-framerate", format.frameRate.ffmpegString]
         switch format.pixelLayout {
         case .v210: return ["-f", "v210"] + size
         case .uyvy422: return ["-f", "rawvideo", "-pixel_format", "uyvy422"] + size

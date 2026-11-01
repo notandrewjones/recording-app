@@ -29,6 +29,7 @@ build/Build/Products/Debug/ISORecorder.app/Contents/MacOS/ISORecorder
 ```
 
 Pass `-synthetic 4` to start with four generated inputs. Inputs > Add Synthetic Input (⇧⌘N) adds more.
+Add `-syntheticGrain YES` for realistic encoder load, and `-autoRecordSeconds 60` to record unattended.
 
 Recordings go to `~/Movies/ISO Recorder`. Change this with
 `defaults write com.notandrewjones.ISORecorder recordingRoot /path`.
@@ -37,7 +38,7 @@ Recordings go to `~/Movies/ISO Recorder`. Change this with
 
 ```sh
 cd Packages/ISOCore
-swift run isorec record --root /path/to/recordings --inputs 2 --seconds 30 --codec hq
+swift run -c release isorec record --root /path/to/recordings --inputs 5 --seconds 60 --grain
 swift run isorec recover /path/to/recordings/<session>
 ```
 

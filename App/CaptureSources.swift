@@ -119,6 +119,11 @@ private extension VideoFormat {
 
 /// Bars and tone at the format's exact rate, for working on everything above capture without hardware.
 final class SyntheticCaptureSource: CaptureSource {
+    /// `-syntheticGrain YES` adds grain, so that encoder and disk load match real cameras.
+    private static let grainPool: SyntheticFramePool? = UserDefaults.standard.bool(forKey: "syntheticGrain")
+        ? SyntheticFramePool(format: .hd1080p5994)
+        : nil
+
     let input: CaptureInput
     let store = PreviewFrameStore()
     let sink = RecorderSink()
@@ -144,7 +149,8 @@ final class SyntheticCaptureSource: CaptureSource {
         let source = SyntheticSource(
             format: format,
             audioChannels: audioChannels,
-            timecodeStart: Timecode.timeOfDay(date: Date(), frameRate: format.frameRate)
+            timecodeStart: Timecode.timeOfDay(date: Date(), frameRate: format.frameRate),
+            pool: Self.grainPool
         )
         source.onFrame = { frame in
             store.offer(format: frame.format, bytes: frame.video, timecode: frame.timecode, hasSignal: frame.hasSignal)

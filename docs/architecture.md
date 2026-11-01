@@ -49,6 +49,18 @@ A gap longer than 2 s is too long to fill and starts a new segment instead. So d
 
 Stopping closes the ring, the writers drain it, and ffmpeg exits on EOF.
 
+Inputs share nothing below the session: each has its own ring, threads, ffmpeg and queue. Killing one
+ffmpeg and hanging another during a four-input recording left the other two with no repeats and no restarts.
+An input that arrives mid-session joins it, and one that returns reattaches to its recorder.
+
+## Load metrics
+
+- **Ring fill per input** is the first warning. It stays near zero until an encoder falls behind.
+  Under 50% is healthy, under 90% strained, and above that frames are about to repeat.
+- **Status bar:** CPU, memory, write rate, free space and time remaining. Time remaining uses the live
+  rate while recording, and the estimate for armed inputs when idle.
+- **Per input:** segment, frames, repeats, gaps and restarts.
+
 ## Capture and formats
 
 Each input starts at 1080p59.94 with format detection enabled. On a change, the callback follows the

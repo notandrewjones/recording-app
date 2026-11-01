@@ -2,10 +2,10 @@ import Foundation
 import ISOCore
 import os
 
-final class UnfairLock: @unchecked Sendable {
+public final class UnfairLock: @unchecked Sendable {
     private let pointer: UnsafeMutablePointer<os_unfair_lock>
 
-    init() {
+    public init() {
         pointer = .allocate(capacity: 1)
         pointer.initialize(to: os_unfair_lock())
     }
@@ -15,7 +15,7 @@ final class UnfairLock: @unchecked Sendable {
         pointer.deallocate()
     }
 
-    func withLock<T>(_ body: () -> T) -> T {
+    public func withLock<T>(_ body: () -> T) -> T {
         os_unfair_lock_lock(pointer)
         defer { os_unfair_lock_unlock(pointer) }
         return body()

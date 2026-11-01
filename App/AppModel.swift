@@ -49,6 +49,11 @@ final class AppModel: ObservableObject {
     @Published private(set) var isRecording = false
     @Published private(set) var isFinalizing = false
     @Published private(set) var message: String?
+    @Published private(set) var systemSample: SystemMetrics.Sample?
+    @Published private(set) var freeBytes: Int64 = 0
+    @Published private(set) var writeBytesPerSecond = 0.0
+    @Published private(set) var storageLevel = StoragePolicy.Level.ok
+    @Published private(set) var estimatedBytesPerHour = 0.0
 
     private var session: RecordingSession?
     /// Recorders in this session by input ID, kept so that a device that returns finds its recorder again.
@@ -57,6 +62,9 @@ final class AppModel: ObservableObject {
     private let discovery = DLDiscovery()
     private var refreshTimer: Timer?
     private var syntheticCount = 0
+    private var inputRebuildPending = false
+    private let metrics = SystemMetrics()
+    private var lastMetricsUptime: UInt64 = 0
 
     init() {
         do {
@@ -72,6 +80,7 @@ final class AppModel: ObservableObject {
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.tiles.forEach { $0.refresh() }
+                self?.refreshMetrics()
             }
         }
         recoverInterruptedSessions()
@@ -88,6 +97,36 @@ final class AppModel: ObservableObject {
                 self?.stopAll()
             }
         }
+    }
+
+    private func refreshMetrics() {
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard now - lastMetricsUptime >= 1_000_000_000 else { return }
+        lastMetricsUptime = now
+        systemSample = metrics.sample()
+
+        let armed = tiles.filter(\.isArmed)
+        estimatedBytesPerHour = armed.compactMap { tile -> Double? in
+            guard let format = tile.status.signal.format else { return nil }
+            return StorageEstimate.bytesPerHour(format: format, codec: .proResHQ, audio: AudioFormat(channels: tile.source.audioChannels))
+        }.reduce(0, +)
+
+        if let session {
+            let health = session.health
+            freeBytes = health.freeBytes
+            writeBytesPerSecond = health.writeBytesPerSecond
+            storageLevel = health.level
+        } else {
+            freeBytes = SystemMetrics.freeBytes(at: (recordingRoot as NSString).deletingLastPathComponent)
+            writeBytesPerSecond = 0
+            storageLevel = .ok
+        }
+    }
+
+    /// Time left on the drive at the current write rate, or the estimate for armed inputs when idle.
+    var remainingSeconds: Double? {
+        let rate = writeBytesPerSecond > 0 ? writeBytesPerSecond : estimatedBytesPerHour / 3600
+        return rate > 0 ? Double(freeBytes) / rate : nil
     }
 
     /// Folder for recordings. The default can be overridden with the `recordingRoot` default.
@@ -110,6 +149,12 @@ final class AppModel: ObservableObject {
         do {
             try FileManager.default.createDirectory(atPath: recordingRoot, withIntermediateDirectories: true)
             let session = try RecordingSession(rootPath: recordingRoot, environment: environment)
+            session.onStoppedForDiskSpace = { [weak self] in
+                Task { @MainActor in
+                    self?.stopAll()
+                    self?.message = "Stopped: the drive is nearly full."
+                }
+            }
             armed.forEach { attach($0, to: session) }
             session.startAll()
             self.session = session
@@ -136,7 +181,7 @@ final class AppModel: ObservableObject {
                     $0.recorder = nil
                 }
                 self?.isFinalizing = false
-                self?.message = "Saved to \(session.layout.sessionDirectory)"
+                if self?.message == nil { self?.message = "Saved to \(session.layout.sessionDirectory)" }
             }
         }
     }
@@ -201,17 +246,44 @@ final class AppModel: ObservableObject {
         }
         driverStatus = "Desktop Video \(driver), SDK \(DLDiscovery.sdkVersion)"
 
-        let started = discovery.start(
+        let started = startDeviceNotifications()
+        if !started {
+            driverStatus = "Could not start device discovery. Desktop Video \(driver) may be older than SDK \(DLDiscovery.sdkVersion)."
+        }
+    }
+
+    private func startDeviceNotifications() -> Bool {
+        discovery.start(
             arrived: { [weak self] device in
                 Task { @MainActor in self?.add(DeckLinkCaptureSource(device: device)) }
             },
             removed: { [weak self] device in
                 let id = device.identifier
                 Task { @MainActor in self?.remove(id: id) }
+            },
+            profileChanged: { [weak self] in
+                Task { @MainActor in self?.scheduleInputRebuild() }
             }
         )
-        if !started {
-            driverStatus = "Could not start device discovery. Desktop Video \(driver) may be older than SDK \(DLDiscovery.sdkVersion)."
+    }
+
+    /// One profile change notifies every sub-device, so the notifications are coalesced into one rebuild.
+    private func scheduleInputRebuild() {
+        guard !inputRebuildPending else { return }
+        inputRebuildPending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.inputRebuildPending = false
+            self?.rebuildDeckLinkInputs()
+        }
+    }
+
+    /// A profile change alters which connectors are inputs, for example on a Duo 2,
+    /// so the inputs are rediscovered. Recording inputs that survive rejoin the session.
+    private func rebuildDeckLinkInputs() {
+        tiles.filter { !$0.source.input.isSynthetic }.forEach { remove(id: $0.id) }
+        discovery.stop()
+        if !startDeviceNotifications() {
+            driverStatus = "Could not restart device discovery after a profile change."
         }
     }
 

@@ -60,7 +60,10 @@ typedef void (^DLFormatHandler)(DLFormat format);
 @property (class, nonatomic, readonly) NSString *sdkVersion;
 
 /// Handlers run on an SDK thread, once per capture-capable sub-device, including those already present.
-- (BOOL)startWithArrived:(void (^)(DLInput *input))arrived removed:(void (^)(DLInput *input))removed;
+/// `profileChanged` fires when a device's profile is activated, which can change the set of inputs.
+- (BOOL)startWithArrived:(void (^)(DLInput *input))arrived
+                 removed:(void (^)(DLInput *input))removed
+          profileChanged:(void (^)(void))profileChanged;
 - (void)stop;
 @end
 

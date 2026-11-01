@@ -55,6 +55,9 @@ public struct InputRecorderStatus: Sendable {
     public var repeatedFrames: Int
     public var restarts: Int
     public var ringFill: Double
+    public var peakRingFill: Double
+    /// Frames lost between segments, from a crash or restart. They are not in any file.
+    public var gapFrames: Int
     public var bytesPerSecond: Double
     public var ffmpegProcessIdentifier: Int32?
 }
@@ -99,6 +102,10 @@ public final class InputRecorder: @unchecked Sendable {
     private var closedFrames = 0
     private var closedRepeats = 0
     private var restarts = 0
+    private var peakRingFill = 0.0
+    private var gapFrames = 0
+    /// Set when a segment fails, so the next opening can measure what was lost in between.
+    private var failedAtHostNanos: UInt64?
 
     init(id: String, label: String, settings: InputRecorderSettings, store: SessionStore, finalizer: Finalizer, environment: FFmpegEnvironment, socketDirectory: String, socketPrefix: String) {
         self.id = id
@@ -181,11 +188,11 @@ public final class InputRecorder: @unchecked Sendable {
         }
     }
 
-    public func stopRecording() {
+    public func stopRecording(reason: SessionManifest.EndReason = .stopped) {
         queue.async { [self] in
             guard recordingRequested else { return }
             recordingRequested = false
-            closingReason = .stopped
+            closingReason = reason
             send(.stopRequested)
             stopMonitor()
             discardRing()
@@ -225,6 +232,8 @@ public final class InputRecorder: @unchecked Sendable {
                 repeatedFrames: closedRepeats + live.1,
                 restarts: restarts,
                 ringFill: lock.withLock { ring?.fillLevel ?? 0 },
+                peakRingFill: peakRingFill,
+                gapFrames: gapFrames,
                 bytesPerSecond: bytesPerSecond,
                 ffmpegProcessIdentifier: current?.processIdentifier
             )
@@ -340,6 +349,13 @@ public final class InputRecorder: @unchecked Sendable {
     }
 
     private func recordOpening(_ opening: SegmentRecorder.Opening, number: Int, format: VideoFormat, configuration: SegmentRecorder.Configuration) {
+        if let failedAt = failedAtHostNanos, opening.startHostNanos > failedAt {
+            let lost = max(0, Int((seconds(opening.startHostNanos - failedAt) * format.frameRate.doubleValue).rounded()) - 1)
+            gapFrames += lost
+            log("recording_gap", detail: "\(lost) frames")
+        }
+        failedAtHostNanos = nil
+
         let layout = store.layout
         let record = SessionManifest.SegmentRecord(
             number: number,
@@ -390,6 +406,7 @@ public final class InputRecorder: @unchecked Sendable {
             removeEmpty(number: number, recorder: recorder)
         } else {
             let reason: SessionManifest.EndReason = wasCurrent || !outcome.drained ? .recorderFailed : closingReason
+            if reason == .recorderFailed { failedAtHostNanos = outcome.lastHostNanos }
             store.updateSegment(inputID: id, number: number) {
                 $0.state = .closed
                 $0.frames = outcome.framesWritten
@@ -437,9 +454,10 @@ public final class InputRecorder: @unchecked Sendable {
     private func monitorTick() {
         let now = DispatchTime.now().uptimeNanoseconds
 
-        let (sinceIngest, wasReceiving, queued) = lock.withLock {
-            (seconds(now - lastIngestUptime), lastSignal == true, ring?.queuedFrames ?? 0)
+        let (sinceIngest, wasReceiving, queued, fill) = lock.withLock {
+            (seconds(now - lastIngestUptime), lastSignal == true, ring?.queuedFrames ?? 0, ring?.fillLevel ?? 0)
         }
+        peakRingFill = max(peakRingFill, fill)
         if wasReceiving, sinceIngest > settings.signalTimeoutSeconds {
             lock.withLock { lastSignal = false }
             send(.signalLost)
