@@ -36,7 +36,7 @@ public struct InputRecorderSettings: Sendable {
     public var fullSyncSeconds: Double
     public var allowSoftwareProRes: Bool
 
-    public init(codec: Codec = .proResHQ, audio: AudioFormat? = AudioFormat(channels: 16), ringSeconds: Double = 1, stallSeconds: Double = 5, signalTimeoutSeconds: Double = 1, fullSyncSeconds: Double = 2, allowSoftwareProRes: Bool = false) {
+    public init(codec: Codec = .proResLT, audio: AudioFormat? = AudioFormat(channels: 16), ringSeconds: Double = 1, stallSeconds: Double = 5, signalTimeoutSeconds: Double = 1, fullSyncSeconds: Double = 2, allowSoftwareProRes: Bool = false) {
         self.codec = codec
         self.audio = audio
         self.ringSeconds = ringSeconds

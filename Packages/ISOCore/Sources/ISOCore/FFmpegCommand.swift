@@ -40,6 +40,9 @@ public enum FFmpegCommandError: Error, Equatable, Sendable {
     case socketPathTooLong(String)
     case audioSocketMissing
     case unsupportedAudioChannelCount(Int)
+    case unsupportedRateControl(LongGOPEncoder)
+    case qualityOutOfRange(LongGOPEncoder, Int)
+    case invalidBitrate(Int)
 }
 
 /// Builds ffmpeg argument lists. The rationale for each non-obvious flag is in docs/decisions.md.
@@ -70,7 +73,7 @@ public enum FFmpegCommand {
             args += ["-map", "0:v", "-map", "1:a"]
         }
 
-        let encoder = videoEncoder(config)
+        let encoder = try videoEncoder(config)
         args += ["-vf", frameFilter(config.format, encoderPixelFormat: encoder.pixelFormat)]
         args += encoder.arguments
         if config.audio != nil {
@@ -117,15 +120,83 @@ public enum FFmpegCommand {
         }
     }
 
-    private static func videoEncoder(_ config: RecorderConfiguration) -> (arguments: [String], pixelFormat: String) {
+    private static func videoEncoder(_ config: RecorderConfiguration) throws -> (arguments: [String], pixelFormat: String) {
         switch config.codec {
-        case .h264(let rate):
-            return (["-c:v", "h264_videotoolbox", "-b:v", "\(rate)M", "-realtime", "1"], "nv12")
-        case .hevc(let rate):
-            return (["-c:v", "hevc_videotoolbox", "-b:v", "\(rate)M", "-realtime", "1", "-tag:v", "hvc1"], "p010le")
+        case .longGOP(let settings):
+            return try longGOPEncoder(settings, format: config.format)
         case .proResProxy, .proResLT, .proRes422, .proResHQ, .proRes4444:
             return config.allowSoftwareProRes ? softwareProRes(config.codec) : hardwareProRes(config.codec)
         }
+    }
+
+    private static func longGOPEncoder(_ settings: LongGOPSettings, format: VideoFormat) throws -> (arguments: [String], pixelFormat: String) {
+        try settings.validate()
+        let encoder = settings.encoder
+        var arguments: [String]
+        let pixelFormat: String
+
+        // `prio_speed` is what lets five HEVC hardware streams hold 59.94. Without it they repeat frames.
+        switch encoder {
+        case .h264Hardware, .h264Software:
+            arguments = ["-c:v", "h264_videotoolbox", "-realtime", "1", "-prio_speed", "1"]
+            pixelFormat = "nv12"
+        case .hevcHardware, .hevcSoftware:
+            arguments = ["-c:v", "hevc_videotoolbox", "-realtime", "1", "-prio_speed", "1", "-tag:v", "hvc1"]
+            if settings.chroma422 {
+                arguments += ["-profile:v", "main42210"]
+                pixelFormat = "p210le"
+            } else {
+                pixelFormat = "p010le"
+            }
+        case .x264:
+            arguments = ["-c:v", "libx264", "-preset", settings.preset.rawValue]
+            pixelFormat = "yuv420p"
+        case .x265:
+            arguments = ["-c:v", "libx265", "-preset", settings.preset.rawValue, "-tag:v", "hvc1"]
+            pixelFormat = "yuv420p10le"
+        }
+        if encoder.isAppleSoftware {
+            arguments += ["-require_sw", "1"]
+        }
+
+        let frames = max(1, Int((settings.keyframeSeconds * format.frameRate.doubleValue).rounded()))
+        arguments += ["-g", String(frames), "-bf", "0"]
+        arguments += rateControlArguments(settings)
+        return (arguments, pixelFormat)
+    }
+
+    private static func rateControlArguments(_ settings: LongGOPSettings) -> [String] {
+        let isX26x = settings.encoder == .x264 || settings.encoder == .x265
+        let extraParameters = isX26x ? settings.encoder == .x264 ? "-x264-params" : "-x265-params" : ""
+        var hrd = "log-level=warning"
+
+        var arguments: [String]
+        switch settings.rateControl {
+        case .cbr(let rate):
+            arguments = ["-b:v", "\(rate)k"]
+            if isX26x {
+                arguments += ["-minrate", "\(rate)k", "-maxrate", "\(rate)k", "-bufsize", "\(rate)k"]
+                hrd = settings.encoder == .x264 ? "nal-hrd=cbr" : "log-level=warning:hrd=1:strict-cbr=1"
+            } else {
+                arguments += ["-constant_bit_rate", "1"]
+            }
+        case .abr(let rate):
+            arguments = ["-b:v", "\(rate)k"]
+        case .vbr(let rate, let maximum):
+            arguments = ["-b:v", "\(rate)k", "-maxrate", "\(maximum)k", "-bufsize", "\(maximum)k"]
+        case .constantQuality(let value, let maximum):
+            arguments = isX26x ? ["-crf", String(value)] : ["-q:v", String(value)]
+            if let maximum {
+                arguments += ["-maxrate", "\(maximum)k", "-bufsize", "\(maximum)k"]
+            }
+        }
+        if isX26x {
+            // x264 reads log-level differently, and only the CBR flag is needed there.
+            if settings.encoder == .x265 || hrd != "log-level=warning" {
+                arguments += [extraParameters, hrd]
+            }
+        }
+        return arguments
     }
 
     private static func hardwareProRes(_ codec: Codec) -> (arguments: [String], pixelFormat: String) {

@@ -54,6 +54,9 @@ final class AppModel: ObservableObject {
     @Published private(set) var writeBytesPerSecond = 0.0
     @Published private(set) var storageLevel = StoragePolicy.Level.ok
     @Published private(set) var estimatedBytesPerHour = 0.0
+    @Published private(set) var capacityWarnings: [String] = []
+
+    let outputSettings: OutputSettingsStore
 
     private var session: RecordingSession?
     /// Recorders in this session by input ID, kept so that a device that returns finds its recorder again.
@@ -67,6 +70,7 @@ final class AppModel: ObservableObject {
     private var lastMetricsUptime: UInt64 = 0
 
     init() {
+        outputSettings = OutputSettingsStore()
         do {
             environment = try FFmpegEnvironment.locate(preferredPath: UserDefaults.standard.string(forKey: "ffmpegPath"))
         } catch {
@@ -107,9 +111,13 @@ final class AppModel: ObservableObject {
 
         let armed = tiles.filter(\.isArmed)
         estimatedBytesPerHour = armed.compactMap { tile -> Double? in
-            guard let format = tile.status.signal.format else { return nil }
-            return StorageEstimate.bytesPerHour(format: format, codec: .proResHQ, audio: AudioFormat(channels: tile.source.audioChannels))
+            let settings = outputSettings.settings(for: tile.id)
+            let format = tile.status.signal.format ?? referenceFormat
+            return StorageEstimate.bytesPerHour(format: format, codec: settings.codec, audio: AudioFormat(channels: audioChannels(tile, settings)))
         }.reduce(0, +)
+        capacityWarnings = EncoderCapacity.warnings(for: armed.map {
+            (outputSettings.settings(for: $0.id).codec, $0.status.signal.format ?? referenceFormat)
+        })
 
         if let session {
             let health = session.health
@@ -121,6 +129,16 @@ final class AppModel: ObservableObject {
             writeBytesPerSecond = 0
             storageLevel = .ok
         }
+    }
+
+    /// The format used for estimates when an input has no signal yet.
+    var referenceFormat: VideoFormat {
+        tiles.compactMap(\.status.signal.format).first ?? .hd1080p5994
+    }
+
+    /// The configured channel count, limited to what the input can provide.
+    private func audioChannels(_ tile: InputTile, _ settings: OutputSettings) -> Int {
+        min(settings.audioChannels, tile.source.audioChannels)
     }
 
     /// Time left on the drive at the current write rate, or the estimate for armed inputs when idle.
@@ -191,11 +209,11 @@ final class AppModel: ObservableObject {
     }
 
     private func attach(_ tile: InputTile, to session: RecordingSession) {
-        let audio = AudioFormat(channels: tile.source.audioChannels)
+        let output = outputSettings.settings(for: tile.id)
         let recorder = session.addInput(
             id: tile.id,
             label: tile.source.input.displayName,
-            settings: InputRecorderSettings(audio: audio)
+            settings: InputRecorderSettings(codec: output.codec, audio: AudioFormat(channels: audioChannels(tile, output)))
         )
         recorders[tile.id] = recorder
         tile.recorder = recorder

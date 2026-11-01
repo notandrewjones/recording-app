@@ -41,6 +41,10 @@ struct ISORecorderApp: App {
                 }
         }
         .windowStyle(.hiddenTitleBar)
+        Settings {
+            OutputSettingsView(model: model, store: model.outputSettings)
+                .preferredColorScheme(.dark)
+        }
         .commands {
             CommandMenu("Record") {
                 Button(model.isRecording ? "Stop All" : "Record All") { model.toggleRecordAll() }
@@ -64,6 +68,7 @@ private enum Palette {
     static let tile = Color(white: 0.10)
     static let line = Color(white: 0.20)
     static let secondary = Color(white: 0.62)
+    static let primaryText = Color(white: 0.9)
     static let locked = Color(red: 0.25, green: 0.80, blue: 0.40)
     static let warning = Color(red: 0.95, green: 0.70, blue: 0.20)
     static let tally = Color(red: 0.90, green: 0.12, blue: 0.14)
@@ -71,6 +76,7 @@ private enum Palette {
 
 struct MultiviewScreen: View {
     @ObservedObject var model: AppModel
+    @Environment(\.openSettings) private var openSettings
 
     private var columns: Int {
         max(1, Int(Double(model.tiles.count).squareRoot().rounded(.up)))
@@ -99,6 +105,10 @@ struct MultiviewScreen: View {
             StatusBar(model: model)
         }
         .background(Palette.background)
+        .task {
+            // `-openSettings YES` opens the output settings on launch, for checking their layout.
+            if UserDefaults.standard.bool(forKey: "openSettings") { openSettings() }
+        }
     }
 
     private var rows: [[InputTile]] {
@@ -244,7 +254,14 @@ struct StatusBar: View {
             } else if model.isFinalizing {
                 Text("FINALIZING").foregroundStyle(Palette.warning)
             }
-            if let message = model.message {
+            SettingsLink {
+                Text(model.outputSettings.defaults.codec.displayName)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Palette.primaryText)
+            if let warning = model.capacityWarnings.first {
+                Text(warning).foregroundStyle(Palette.warning).lineLimit(1).layoutPriority(1).help(warning)
+            } else if let message = model.message {
                 Text(message).lineLimit(1)
             }
             Spacer()

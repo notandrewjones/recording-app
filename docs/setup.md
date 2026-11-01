@@ -34,11 +34,15 @@ Add `-syntheticGrain YES` for realistic encoder load, and `-autoRecordSeconds 60
 Recordings go to `~/Movies/ISO Recorder`. Change this with
 `defaults write com.notandrewjones.ISORecorder recordingRoot /path`.
 
+Output settings are under ISO Recorder > Settings (⌘,), or the codec name in the status bar.
+
 ## Record without the app
 
 ```sh
 cd Packages/ISOCore
 swift run -c release isorec record --root /path/to/recordings --inputs 5 --seconds 60 --grain
+swift run -c release isorec record --root /path/to/recordings --encoder hevc-hw --rate cbr --kbps 30000
+swift run -c release isorec record --root /path/to/recordings --encoder x264 --rate cq --quality 23
 swift run isorec recover /path/to/recordings/<session>
 ```
 

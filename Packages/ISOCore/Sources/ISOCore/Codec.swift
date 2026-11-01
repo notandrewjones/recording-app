@@ -6,8 +6,7 @@ public enum Codec: Hashable, Codable, Sendable {
     case proRes422
     case proResHQ
     case proRes4444
-    case h264(megabitsPerSecond: Int)
-    case hevc(megabitsPerSecond: Int)
+    case longGOP(LongGOPSettings)
 
     public var displayName: String {
         switch self {
@@ -16,15 +15,14 @@ public enum Codec: Hashable, Codable, Sendable {
         case .proRes422: "ProRes 422"
         case .proResHQ: "ProRes 422 HQ"
         case .proRes4444: "ProRes 4444"
-        case .h264(let rate): "H.264 \(rate) Mb/s"
-        case .hevc(let rate): "HEVC \(rate) Mb/s"
+        case .longGOP(let settings): settings.summary
         }
     }
 
     public var isProRes: Bool {
         switch self {
         case .proResProxy, .proResLT, .proRes422, .proResHQ, .proRes4444: true
-        case .h264, .hevc: false
+        case .longGOP: false
         }
     }
 
@@ -39,20 +37,21 @@ public enum Codec: Hashable, Codable, Sendable {
         case .proRes422: 147
         case .proResHQ: 220
         case .proRes4444: 330
-        case .h264, .hevc: nil
+        case .longGOP: nil
         }
     }
 
-    public func estimatedVideoBytesPerSecond(for format: VideoFormat) -> Double {
+    /// Nil for constant quality with no cap, where the rate depends entirely on the picture.
+    public func estimatedVideoBytesPerSecond(for format: VideoFormat) -> Double? {
         if let base = proResMegabitsAtHD2997 {
             let pixelRate = Double(format.width * format.height) * format.frameRate.doubleValue
             let referencePixelRate = 1920.0 * 1080.0 * 30000.0 / 1001.0
             return base * 1_000_000 / 8 * pixelRate / referencePixelRate
         }
-        switch self {
-        case .h264(let rate), .hevc(let rate): return Double(rate) * 1_000_000 / 8
-        default: return 0
+        if case .longGOP(let settings) = self {
+            return settings.rateControl.worstCaseKilobitsPerSecond.map { Double($0) * 1000 / 8 }
         }
+        return nil
     }
 }
 
@@ -73,8 +72,8 @@ public struct AudioFormat: Hashable, Codable, Sendable {
 }
 
 public enum StorageEstimate {
-    public static func bytesPerHour(format: VideoFormat, codec: Codec, audio: AudioFormat?) -> Double {
-        let video = codec.estimatedVideoBytesPerSecond(for: format)
+    public static func bytesPerHour(format: VideoFormat, codec: Codec, audio: AudioFormat?) -> Double? {
+        guard let video = codec.estimatedVideoBytesPerSecond(for: format) else { return nil }
         return (video + (audio?.storedBytesPerSecond ?? 0)) * 3600
     }
 

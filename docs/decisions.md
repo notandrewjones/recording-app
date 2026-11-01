@@ -38,6 +38,22 @@ apps open. Runs were 25 s unless noted. Repeated frames are the ones that matter
 
 8 is the edge, not a working number. Plan on 5 or 6 until a soak test says otherwise.
 
+Other codecs through the same path, all without UI load:
+
+| Codec | Inputs | Repeated | Peak ring |
+|---|---|---|---|
+| ProRes LT | 5 | 0 | 8% |
+| ProRes Proxy | 5 | 0 | 1% |
+| HEVC hardware CBR 20 Mb/s | 5 | 0 | 83% |
+| HEVC hardware ABR 20 Mb/s | 5 | 0 | 46% |
+| HEVC hardware CBR 20 Mb/s | 6 | 2947 | 100% |
+| H.264 hardware CBR 20 Mb/s | 3 | 0 | 1% |
+| H.264 hardware CBR 20 Mb/s | 4 | 1749 | 100% |
+| x264 veryfast CRF 23 | 2 | 0 | 1% |
+
+CPU stayed near 50% in the failing hardware runs, so these limits belong to the media engine.
+`EncoderCapacity` warns before recording when a plan exceeds them.
+
 Raw transport benchmarks, without audio or the ring:
 
 | Load | Result |
@@ -45,7 +61,7 @@ Raw transport benchmarks, without audio or the ring:
 | ProRes HQ 2160p59.94 × 1 | Clean |
 | × 2 | 104 of 958 late, startup not separated |
 | HEVC 50 Mb/s 1080p59.94 × 4 | Clean |
-| H.264 50 Mb/s 1080p59.94 × 4 | Failed, 1353 of 1916 late, cause not investigated |
+| H.264 50 Mb/s 1080p59.94 × 4 | Failed, 1353 of 1916 late, later traced to the hardware limit above |
 | `prores_ks` HQ 1080p59.94 × 1 | Failed, 414 of 479 late, about 11 cores |
 
 Each ffmpeg holds about 450–950 MB, which is not its own frame queue, since shrinking that changed nothing.
@@ -128,3 +144,33 @@ notifications are coalesced into one rebuild after 0.5 s. This is compiled but u
 
 After a crash or kill, macOS restoration brought the app back with no window. A recorder relaunched
 mid-show has to show the multiview, so restoration is off and the app uses a single `Window` scene.
+
+## ProRes LT is the default
+
+HQ is more storage than this project can afford. LT stays intra-frame, so replay is unaffected, at about
+half the data rate. It records 5 inputs with the ring at 8%.
+
+## Encoder choices match OBS, with measured limits
+
+All six OBS choices work here: Apple VideoToolbox hardware and software for H.264 and HEVC, plus x264 and
+x265. x264 and x265 come from the Homebrew GPL ffmpeg, so a bundled LGPL build would lose them.
+
+| Encoder | Single 1080p59.94 stream | Rate modes |
+|---|---|---|
+| Apple HEVC hardware | Real time, 5 streams | CBR, ABR, VBR, constant quality |
+| Apple H.264 hardware | Real time, 3 streams | CBR, ABR, VBR, constant quality |
+| x264 veryfast | About 100–150 fps, 2 streams | CBR, ABR, VBR, CRF |
+| Apple H.264 software | About 80 fps | ABR only, constant quality is rejected |
+| x265 ultrafast | 38–54 fps, not real time | CBR, ABR, VBR, CRF |
+| Apple HEVC software | 3–7 fps on grain, not real time | ABR, constant quality |
+
+## CRF is x264 and x265 only
+
+Apple's encoders have no CRF. Their equivalent is constant quality, 1 to 100 with higher meaning better,
+the reverse of CRF. The UI labels each correctly. Uncapped constant quality reached 824 Mb/s on grain at
+q=75, so the UI offers a bitrate cap and warns without one. There is no storage estimate when uncapped.
+
+## `-prio_speed 1` on VideoToolbox long-GOP encoders
+
+Without it, five HEVC streams at CBR repeated frames. With it, they recorded clean. The cost in compression
+efficiency has not been measured. B-frames are off, so frame order matches capture order for replay.

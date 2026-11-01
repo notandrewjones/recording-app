@@ -5,7 +5,9 @@ import ISOEngine
 // Headless recorder for testing the engine with synthetic sources.
 //
 //   isorec record --root DIR [--name NAME] [--inputs N] [--seconds S] [--codec hq|lt|422|proxy|4444]
-//                 [--no-audio] [--grain] [--min-free-mb MB]
+//                 [--no-audio] [--audio-channels 2|8|16] [--grain] [--min-free-mb MB]
+//                 [--encoder hevc-hw|hevc-sw|x265|h264-hw|h264-sw|x264] [--rate cbr|abr|vbr|cq]
+//                 [--kbps N] [--max-kbps N] [--quality N] [--keyframe S] [--preset NAME] [--chroma422]
 //   isorec recover DIR
 
 func option(_ name: String) -> String? {
@@ -22,13 +24,43 @@ func fail(_ message: String) -> Never {
     exit(1)
 }
 
-func codec(_ name: String) -> Codec {
+func longGOPEncoder(_ name: String) -> LongGOPEncoder? {
     switch name {
-    case "proxy": .proResProxy
-    case "lt": .proResLT
-    case "422": .proRes422
-    case "4444": .proRes4444
-    default: .proResHQ
+    case "hevc-hw": .hevcHardware
+    case "hevc-sw": .hevcSoftware
+    case "x265": .x265
+    case "h264-hw": .h264Hardware
+    case "h264-sw": .h264Software
+    case "x264": .x264
+    default: nil
+    }
+}
+
+func codec(_ name: String) -> Codec {
+    if let encoder = longGOPEncoder(option("--encoder") ?? "") {
+        let kbps = Int(option("--kbps") ?? "") ?? 20_000
+        let maximum = Int(option("--max-kbps") ?? "")
+        let rate: RateControl
+        switch option("--rate") ?? "abr" {
+        case "cbr": rate = .cbr(kbps: kbps)
+        case "vbr": rate = .vbr(kbps: kbps, maximumKbps: maximum ?? kbps * 2)
+        case "cq": rate = .constantQuality(value: Int(option("--quality") ?? "") ?? encoder.defaultQuality, maximumKbps: maximum)
+        default: rate = .abr(kbps: kbps)
+        }
+        return .longGOP(LongGOPSettings(
+            encoder: encoder,
+            rateControl: rate,
+            keyframeSeconds: Double(option("--keyframe") ?? "") ?? 1,
+            preset: X26xPreset(rawValue: option("--preset") ?? "") ?? .veryfast,
+            chroma422: flag("--chroma422")
+        ))
+    }
+    switch name {
+    case "proxy": return .proResProxy
+    case "lt": return .proResLT
+    case "422": return .proRes422
+    case "4444": return .proRes4444
+    default: return .proResHQ
     }
 }
 
@@ -45,8 +77,8 @@ case "record":
     guard let root = option("--root") else { fail("--root is required") }
     let inputCount = Int(option("--inputs") ?? "") ?? 1
     let seconds = Double(option("--seconds") ?? "") ?? 10
-    let audioChannels = flag("--no-audio") ? 0 : 16
-    let settings = InputRecorderSettings(codec: codec(option("--codec") ?? "hq"), audio: audioChannels > 0 ? AudioFormat(channels: audioChannels) : nil)
+    let audioChannels = flag("--no-audio") ? 0 : Int(option("--audio-channels") ?? "") ?? 16
+    let settings = InputRecorderSettings(codec: codec(option("--codec") ?? "lt"), audio: audioChannels > 0 ? AudioFormat(channels: audioChannels) : nil)
 
     let session: RecordingSession
     do {

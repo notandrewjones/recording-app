@@ -73,19 +73,19 @@ import Testing
 @Suite struct StorageEstimateTests {
     @Test func proResHQMatchesMeasuredRate() {
         // Measured about 55 MB/s per 1080p59.94 HQ stream.
-        let rate = Codec.proResHQ.estimatedVideoBytesPerSecond(for: .hd1080p5994)
+        let rate = Codec.proResHQ.estimatedVideoBytesPerSecond(for: .hd1080p5994) ?? 0
         #expect(abs(rate - 55_000_000) < 500_000)
     }
 
     @Test func proRes4KScalesByPixelRate() {
-        let hd = Codec.proRes422.estimatedVideoBytesPerSecond(for: .hd1080p5994)
-        let uhd = Codec.proRes422.estimatedVideoBytesPerSecond(for: .uhd2160p5994)
+        let hd = Codec.proRes422.estimatedVideoBytesPerSecond(for: .hd1080p5994) ?? 0
+        let uhd = Codec.proRes422.estimatedVideoBytesPerSecond(for: .uhd2160p5994) ?? 1
         #expect(abs(uhd / hd - 4) < 0.01)
     }
 
     @Test func includesAudio() {
-        let without = StorageEstimate.bytesPerHour(format: .hd1080p5994, codec: .proResHQ, audio: nil)
-        let with = StorageEstimate.bytesPerHour(format: .hd1080p5994, codec: .proResHQ, audio: AudioFormat(channels: 16))
+        let without = StorageEstimate.bytesPerHour(format: .hd1080p5994, codec: .proResHQ, audio: nil) ?? 0
+        let with = StorageEstimate.bytesPerHour(format: .hd1080p5994, codec: .proResHQ, audio: AudioFormat(channels: 16)) ?? 0
         let audioBytes: Double = 48_000 * 3 * 16 * 3600
         #expect(with - without == audioBytes)
     }
@@ -121,6 +121,11 @@ import Testing
     @Test func neverUsesNobufferBecauseItDropsTheFirstFrame() throws {
         let args = try FFmpegCommand.recordArguments(config())
         #expect(!args.contains { $0.contains("nobuffer") })
+    }
+
+    @Test func hardwareLongGOPPrioritisesSpeed() throws {
+        let args = try FFmpegCommand.recordArguments(config(codec: .longGOP(.defaultSettings(for: .hevc)), audio: nil))
+        #expect(value(after: "-prio_speed", in: args) == "1")
     }
 
     @Test func decoderStaysSingleThreaded() throws {
@@ -455,7 +460,7 @@ import Testing
     @Test func roundTrips() throws {
         var manifest = SessionManifest(name: "Game", createdAt: Date(timeIntervalSince1970: 1_000_000), createdAtHostNanos: 7)
         var input = SessionManifest.InputRecord(id: "a", label: "Cam 1")
-        var segment = SessionManifest.SegmentRecord(number: 1, workingFile: "w", finalFile: "f", indexFile: "i", logFile: "l", format: .hd1080p5994, codec: .h264(megabitsPerSecond: 50), audioChannels: 16, startTimecode: "01:00:00;00", timecodeIsEmbedded: true, startHostNanos: 9)
+        var segment = SessionManifest.SegmentRecord(number: 1, workingFile: "w", finalFile: "f", indexFile: "i", logFile: "l", format: .hd1080p5994, codec: .longGOP(LongGOPSettings(encoder: .h264Hardware, rateControl: .abr(kbps: 50_000))), audioChannels: 16, startTimecode: "01:00:00;00", timecodeIsEmbedded: true, startHostNanos: 9)
         segment.endReason = .signalLost
         input.segments.append(segment)
         manifest.inputs.append(input)
@@ -499,5 +504,150 @@ import Testing
     @Test func durationText() {
         #expect((3900.0).durationDescription == "1h 05m")
         #expect((750.0).durationDescription == "12m 30s")
+    }
+}
+
+@Suite struct LongGOPTests {
+    func arguments(_ settings: LongGOPSettings, format: VideoFormat = .hd1080p5994) throws -> [String] {
+        try FFmpegCommand.recordArguments(RecorderConfiguration(
+            format: format, codec: .longGOP(settings), audio: nil,
+            videoSocketPath: "/tmp/v.sock", audioSocketPath: nil,
+            startTimecode: Timecode(frameCount: 0, nominalFPS: 60, isDropFrame: true),
+            outputPath: "/rec/a.mov"
+        ))
+    }
+
+    func value(after flag: String, in args: [String]) -> String? {
+        args.firstIndex(of: flag).map { args[$0 + 1] }
+    }
+
+    @Test func hardwareCBRSetsTheConstantFlag() throws {
+        let args = try arguments(LongGOPSettings(encoder: .hevcHardware, rateControl: .cbr(kbps: 20_000)))
+        #expect(value(after: "-c:v", in: args) == "hevc_videotoolbox")
+        #expect(value(after: "-b:v", in: args) == "20000k")
+        #expect(value(after: "-constant_bit_rate", in: args) == "1")
+    }
+
+    @Test func softwareEncodersUseCRFAndHardwareUsesQuality() throws {
+        let crf = try arguments(LongGOPSettings(encoder: .x264, rateControl: .constantQuality(value: 23, maximumKbps: nil)))
+        #expect(value(after: "-crf", in: crf) == "23")
+        let quality = try arguments(LongGOPSettings(encoder: .hevcHardware, rateControl: .constantQuality(value: 60, maximumKbps: nil)))
+        #expect(value(after: "-q:v", in: quality) == "60")
+    }
+
+    @Test func qualityCapBecomesARateLimit() throws {
+        let args = try arguments(LongGOPSettings(encoder: .hevcHardware, rateControl: .constantQuality(value: 60, maximumKbps: 80_000)))
+        #expect(value(after: "-maxrate", in: args) == "80000k")
+    }
+
+    @Test func appleSoftwareIsForced() throws {
+        let args = try arguments(LongGOPSettings(encoder: .h264Software, rateControl: .abr(kbps: 20_000)))
+        #expect(value(after: "-require_sw", in: args) == "1")
+    }
+
+    @Test func keyframeIntervalIsInFrames() throws {
+        let args = try arguments(LongGOPSettings(encoder: .hevcHardware, rateControl: .abr(kbps: 20_000), keyframeSeconds: 2))
+        #expect(value(after: "-g", in: args) == "120")
+        #expect(value(after: "-bf", in: args) == "0")
+    }
+
+    @Test func chroma422SelectsTheProfile() throws {
+        let args = try arguments(LongGOPSettings(encoder: .hevcHardware, rateControl: .abr(kbps: 50_000), chroma422: true))
+        #expect(value(after: "-profile:v", in: args) == "main42210")
+        #expect(value(after: "-vf", in: args)?.contains("format=p210le") == true)
+    }
+
+    @Test func rejectsOutOfRangeValues() {
+        #expect(throws: FFmpegCommandError.qualityOutOfRange(.x264, 90)) {
+            try arguments(LongGOPSettings(encoder: .x264, rateControl: .constantQuality(value: 90, maximumKbps: nil)))
+        }
+        #expect(throws: FFmpegCommandError.invalidBitrate(0)) {
+            try arguments(LongGOPSettings(encoder: .hevcHardware, rateControl: .cbr(kbps: 0)))
+        }
+    }
+
+    @Test func rejectsModesAnEncoderCannotDo() {
+        #expect(throws: FFmpegCommandError.unsupportedRateControl(.hevcSoftware)) {
+            try arguments(LongGOPSettings(encoder: .hevcSoftware, rateControl: .cbr(kbps: 20_000)))
+        }
+    }
+
+    @Test func appleH264SoftwareOffersOnlyABR() {
+        #expect(LongGOPEncoder.h264Software.supportedModes == [.abr])
+    }
+
+    @Test func uncappedQualityHasNoStorageEstimate() {
+        let codec = Codec.longGOP(LongGOPSettings(encoder: .hevcHardware, rateControl: .constantQuality(value: 60, maximumKbps: nil)))
+        #expect(StorageEstimate.bytesPerHour(format: .hd1080p5994, codec: codec, audio: nil) == nil)
+    }
+
+    @Test func storageEstimateUsesTheBitrate() {
+        let codec = Codec.longGOP(LongGOPSettings(encoder: .hevcHardware, rateControl: .cbr(kbps: 40_000)))
+        #expect(StorageEstimate.bytesPerHour(format: .hd1080p5994, codec: codec, audio: nil) == 18_000_000_000)
+    }
+
+    @Test func settingsSurviveJSON() throws {
+        let codec = Codec.longGOP(LongGOPSettings(encoder: .x265, rateControl: .constantQuality(value: 26, maximumKbps: 50_000), preset: .ultrafast))
+        let data = try JSONEncoder().encode(codec)
+        #expect(try JSONDecoder().decode(Codec.self, from: data) == codec)
+    }
+
+    @Test func allChoicesHaveValidDefaults() {
+        for encoder in LongGOPEncoder.allCases {
+            #expect(encoder.qualityRange.contains(encoder.defaultQuality))
+            #expect(!encoder.supportedModes.isEmpty)
+        }
+    }
+}
+
+@Suite struct OutputSettingsTests {
+    @Test func defaultIsProResLT() {
+        #expect(OutputSettings().codec == .proResLT)
+    }
+
+    @Test func switchingEncoderDropsAnUnsupportedMode() {
+        let settings = LongGOPSettings(encoder: .hevcHardware, rateControl: .cbr(kbps: 25_000))
+        let moved = settings.switched(to: .hevcSoftware)
+        #expect(moved.rateControl == .abr(kbps: 25_000))
+    }
+
+    @Test func switchingBetweenQualityScalesResetsTheNumber() {
+        let settings = LongGOPSettings(encoder: .hevcHardware, rateControl: .constantQuality(value: 90, maximumKbps: nil))
+        #expect(settings.switched(to: .x265).rateControl == .constantQuality(value: 23, maximumKbps: nil))
+    }
+
+    @Test func chromaOnlyStaysOnHEVCHardware() {
+        let settings = LongGOPSettings(encoder: .hevcHardware, rateControl: .abr(kbps: 50_000), chroma422: true)
+        #expect(!settings.switched(to: .x265).chroma422)
+    }
+
+    @Test func modeChangesKeepTheBitrate() {
+        #expect(RateControl.cbr(kbps: 40_000).switched(to: .abr, encoder: .hevcHardware) == .abr(kbps: 40_000))
+        #expect(RateControl.abr(kbps: 40_000).switched(to: .vbr, encoder: .hevcHardware) == .vbr(kbps: 40_000, maximumKbps: 60_000))
+    }
+
+    func plan(_ count: Int, _ codec: Codec, format: VideoFormat = .hd1080p5994) -> [(codec: Codec, format: VideoFormat)] {
+        Array(repeating: (codec, format), count: count)
+    }
+
+    @Test func measuredLimitsAreNotFlagged() {
+        #expect(EncoderCapacity.warnings(for: plan(8, .proResLT)).isEmpty)
+        #expect(EncoderCapacity.warnings(for: plan(5, .longGOP(.defaultSettings(for: .hevc)))).isEmpty)
+        #expect(EncoderCapacity.warnings(for: plan(3, .longGOP(.defaultSettings(for: .h264)))).isEmpty)
+    }
+
+    @Test func exceedingAMeasuredLimitWarns() {
+        #expect(EncoderCapacity.warnings(for: plan(6, .longGOP(.defaultSettings(for: .hevc)))).count == 1)
+        #expect(EncoderCapacity.warnings(for: plan(4, .longGOP(.defaultSettings(for: .h264)))).count == 1)
+    }
+
+    @Test func oneUHDStreamCountsAsFourHD() {
+        let uhd = plan(2, .longGOP(.defaultSettings(for: .hevc)), format: .uhd2160p5994)
+        #expect(EncoderCapacity.warnings(for: uhd).count == 1)
+    }
+
+    @Test func slowSoftwareEncodersAlwaysWarn() {
+        let codec = Codec.longGOP(LongGOPSettings(encoder: .x265, rateControl: .constantQuality(value: 26, maximumKbps: nil)))
+        #expect(EncoderCapacity.warnings(for: plan(1, codec)).count == 1)
     }
 }

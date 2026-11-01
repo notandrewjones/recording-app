@@ -413,4 +413,68 @@ import Testing
         let survivor = FileManager.default.fileExists(atPath: final) ? final : working
         #expect(try MediaProbe.videoFrameCount(survivor, environment: environment) == segment.frames)
     }
+
+    static let longGOPCases: [LongGOPSettings] = [
+        .init(encoder: .hevcHardware, rateControl: .cbr(kbps: 8_000)),
+        .init(encoder: .hevcHardware, rateControl: .abr(kbps: 8_000)),
+        .init(encoder: .hevcHardware, rateControl: .vbr(kbps: 8_000, maximumKbps: 12_000)),
+        .init(encoder: .hevcHardware, rateControl: .constantQuality(value: 60, maximumKbps: nil)),
+        .init(encoder: .hevcHardware, rateControl: .constantQuality(value: 60, maximumKbps: 20_000)),
+        .init(encoder: .hevcHardware, rateControl: .abr(kbps: 20_000), chroma422: true),
+        .init(encoder: .hevcSoftware, rateControl: .abr(kbps: 2_000)),
+        .init(encoder: .hevcSoftware, rateControl: .constantQuality(value: 40, maximumKbps: nil)),
+        .init(encoder: .x265, rateControl: .cbr(kbps: 2_000), preset: .ultrafast),
+        .init(encoder: .x265, rateControl: .abr(kbps: 2_000), preset: .ultrafast),
+        .init(encoder: .x265, rateControl: .vbr(kbps: 2_000, maximumKbps: 3_000), preset: .ultrafast),
+        .init(encoder: .x265, rateControl: .constantQuality(value: 28, maximumKbps: nil), preset: .ultrafast),
+        .init(encoder: .h264Hardware, rateControl: .cbr(kbps: 8_000)),
+        .init(encoder: .h264Hardware, rateControl: .abr(kbps: 8_000)),
+        .init(encoder: .h264Hardware, rateControl: .vbr(kbps: 8_000, maximumKbps: 12_000)),
+        .init(encoder: .h264Hardware, rateControl: .constantQuality(value: 60, maximumKbps: nil)),
+        .init(encoder: .h264Software, rateControl: .abr(kbps: 2_000)),
+        .init(encoder: .x264, rateControl: .cbr(kbps: 2_000)),
+        .init(encoder: .x264, rateControl: .abr(kbps: 2_000)),
+        .init(encoder: .x264, rateControl: .vbr(kbps: 2_000, maximumKbps: 3_000)),
+        .init(encoder: .x264, rateControl: .constantQuality(value: 23, maximumKbps: nil)),
+    ]
+
+    /// Every encoder and rate mode the settings window offers must really record, frame-exact.
+    @Test(arguments: longGOPCases)
+    func everyEncoderChoiceRecordsFrameExact(settings: LongGOPSettings) throws {
+        let format = VideoFormat(width: 640, height: 360, frameRate: Rational(30, 1))
+        let harness = try Harness(
+            environment: environment,
+            settings: InputRecorderSettings(codec: .longGOP(settings), audio: AudioFormat(channels: 2), fullSyncSeconds: 0),
+            source: SyntheticSource(format: format, audioChannels: 2)
+        )
+        harness.record(frames: 45)
+
+        let segment = try #require(harness.segments.first)
+        #expect(segment.state == .finalized)
+        let info = try harness.info(segment, environment: environment)
+        #expect(info.codecName == (settings.encoder.family == .hevc ? "hevc" : "h264"))
+        #expect(info.videoFrames == harness.indexRecords(segment).count)
+        #expect(segment.lostFrames == 0)
+    }
+
+    @Test func killedLongGOPRecorderLeavesARecoverableFile() throws {
+        let settings = InputRecorderSettings(codec: .longGOP(.defaultSettings(for: .hevc)), fullSyncSeconds: 0)
+        let harness = try Harness(environment: environment, settings: settings, source: SyntheticSource())
+        harness.source.start(frames: 300)
+        Thread.sleep(forTimeInterval: 0.1)
+        harness.recorder.startRecording()
+        Thread.sleep(forTimeInterval: 3)
+        let pid = try #require(harness.recorder.status().ffmpegProcessIdentifier)
+        #expect(kill(pid, SIGKILL) == 0)
+        harness.source.waitUntilFinished()
+        Thread.sleep(forTimeInterval: 0.2)
+        harness.finish()
+
+        let segments = harness.segments
+        #expect(segments.count == 2)
+        #expect(segments.allSatisfy { $0.state == .finalized })
+        let first = try #require(segments.first)
+        #expect(first.frames > 90)
+        #expect(harness.indexRecords(first).count == first.frames)
+    }
 }
