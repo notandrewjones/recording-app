@@ -1,0 +1,4 @@
+// DECKLINK_SDK_PATH points at the extracted SDK folder, the one containing Mac/include.
+// Set it in Config/Local.xcconfig (git-ignored). See docs/setup.md.
+DECKLINK_SDK_PATH = $(HOME)/Developer/DeckLinkSDK
+#include? "Local.xcconfig"

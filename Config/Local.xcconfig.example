@@ -1,0 +1,2 @@
+// Copy to Config/Local.xcconfig and adjust.
+DECKLINK_SDK_PATH = $(HOME)/Downloads/Blackmagic DeckLink SDK 16.0

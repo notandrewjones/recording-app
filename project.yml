@@ -1,0 +1,38 @@
+name: ISORecorder
+options:
+  bundleIdPrefix: com.notandrewjones
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+configFiles:
+  Debug: Config/App.xcconfig
+  Release: Config/App.xcconfig
+packages:
+  ISOCore:
+    path: Packages/ISOCore
+targets:
+  ISORecorder:
+    type: application
+    platform: macOS
+    sources:
+      - App
+      - Bridge
+    dependencies:
+      - package: ISOCore
+    settings:
+      base:
+        PRODUCT_NAME: ISORecorder
+        SWIFT_VERSION: "5.0"
+        SWIFT_OBJC_BRIDGING_HEADER: App/ISORecorder-Bridging-Header.h
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSHumanReadableCopyright: ""
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.video
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        ENABLE_APP_SANDBOX: NO
+        ENABLE_HARDENED_RUNTIME: NO
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+        CLANG_ENABLE_OBJC_ARC: YES
+        CLANG_CXX_LANGUAGE_STANDARD: c++17
+        HEADER_SEARCH_PATHS: "\"$(DECKLINK_SDK_PATH)/Mac/include\""
