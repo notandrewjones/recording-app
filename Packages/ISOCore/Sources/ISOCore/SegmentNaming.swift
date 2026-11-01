@@ -1,7 +1,8 @@
 import Foundation
 
 /// On-disk layout of one recording session:
-/// `<root>/<session>/<input>/<input>_0001.mov` plus a matching `.idx`, and `<root>/<session>/session.json`.
+/// `<root>/<session>/<input>/<input>_0001.mov` plus matching `.idx` and `.log` files, and `<root>/<session>/session.json`.
+/// While recording, the media is the fragmented `<input>_0001.part.mov`.
 public struct SessionLayout: Hashable, Sendable {
     public var rootPath: String
     public var sessionName: String
@@ -20,6 +21,24 @@ public struct SessionLayout: Hashable, Sendable {
 
     public func segmentPath(inputLabel: String, segment: Int) -> String {
         (inputDirectory(inputLabel: inputLabel) as NSString).appendingPathComponent("\(segmentStem(inputLabel, segment)).mov")
+    }
+
+    public func workingSegmentPath(inputLabel: String, segment: Int) -> String {
+        (inputDirectory(inputLabel: inputLabel) as NSString).appendingPathComponent("\(segmentStem(inputLabel, segment)).part.mov")
+    }
+
+    public func logPath(inputLabel: String, segment: Int) -> String {
+        (inputDirectory(inputLabel: inputLabel) as NSString).appendingPathComponent("\(segmentStem(inputLabel, segment)).log")
+    }
+
+    /// A path relative to the session directory, so a session folder can be moved between drives.
+    public func relativePath(_ path: String) -> String {
+        let prefix = sessionDirectory + "/"
+        return path.hasPrefix(prefix) ? String(path.dropFirst(prefix.count)) : path
+    }
+
+    public func absolutePath(_ relative: String) -> String {
+        (sessionDirectory as NSString).appendingPathComponent(relative)
     }
 
     public func frameIndexPath(inputLabel: String, segment: Int) -> String {

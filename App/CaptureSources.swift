@@ -1,10 +1,34 @@
 import Foundation
 import ISOCore
+import ISOEngine
+import os
+
+/// Passes frames from a capture thread to the input's recorder, when there is one.
+final class RecorderSink: @unchecked Sendable {
+    private var lock = os_unfair_lock()
+    private var recorder: InputRecorder?
+
+    func attach(_ recorder: InputRecorder?) {
+        os_unfair_lock_lock(&lock)
+        self.recorder = recorder
+        os_unfair_lock_unlock(&lock)
+    }
+
+    func send(_ frame: IngestFrame) {
+        os_unfair_lock_lock(&lock)
+        let target = recorder
+        os_unfair_lock_unlock(&lock)
+        target?.ingest(frame)
+    }
+}
 
 /// One capture path. DeckLink and synthetic sources are interchangeable from here up.
 protocol CaptureSource: AnyObject {
     var input: CaptureInput { get }
     var store: PreviewFrameStore { get }
+    var sink: RecorderSink { get }
+    /// Channels this source records, as a count ffmpeg can accept.
+    var audioChannels: Int { get }
     func start() throws
     func stop()
 }
@@ -12,6 +36,7 @@ protocol CaptureSource: AnyObject {
 final class DeckLinkCaptureSource: CaptureSource {
     let input: CaptureInput
     let store = PreviewFrameStore()
+    let sink = RecorderSink()
     let device: DLInput
 
     init(device: DLInput) {
@@ -24,16 +49,34 @@ final class DeckLinkCaptureSource: CaptureSource {
         )
     }
 
+    var audioChannels: Int {
+        FFmpegCommand.supportedAudioChannelCounts.last { $0 <= input.maxAudioChannels } ?? 2
+    }
+
     func start() throws {
         let store = store
-        // Published by the format handler on the capture thread, which is also the only reader.
+        let sink = sink
+        // Written by the format handler on the capture thread, which is also the only reader.
         var format = VideoFormat.hd1080p5994
         try device.start(
-            withAudioChannels: 0,
-            frameHandler: { info, video, _ in
+            withAudioChannels: Int32(audioChannels),
+            frameHandler: { info, video, audio in
                 let current = format
-                guard info.pointee.rowBytes == current.rowBytes, Int(info.pointee.height) == current.height else { return }
-                store.offer(format: current, bytes: video, timecode: Self.timecode(info.pointee, rate: current.frameRate), hasSignal: info.pointee.hasSignal)
+                let frame = info.pointee
+                guard frame.rowBytes == current.rowBytes, Int(frame.height) == current.height else { return }
+                let timecode = Self.timecode(frame, rate: current.frameRate)
+                store.offer(format: current, bytes: video, timecode: timecode, hasSignal: frame.hasSignal)
+                sink.send(IngestFrame(
+                    format: current,
+                    video: video,
+                    audio: audio,
+                    audioSampleFrames: Int(frame.audioSampleFrames),
+                    hostTimeNanos: frame.hostTimeNanos,
+                    streamTime: frame.streamTime,
+                    streamTimeScale: frame.streamTimeScale,
+                    timecode: timecode,
+                    hasSignal: frame.hasSignal
+                ))
             },
             formatHandler: { dlFormat in
                 format = VideoFormat(dlFormat)
@@ -74,13 +117,14 @@ private extension VideoFormat {
     }
 }
 
-/// Generates bars at the format's exact rate, for working on everything above capture without hardware.
+/// Bars and tone at the format's exact rate, for working on everything above capture without hardware.
 final class SyntheticCaptureSource: CaptureSource {
     let input: CaptureInput
     let store = PreviewFrameStore()
+    let sink = RecorderSink()
+    let audioChannels = 16
     private let format: VideoFormat
-    private let queue: DispatchQueue
-    private var timer: DispatchSourceTimer?
+    private var source: SyntheticSource?
 
     init(index: Int, format: VideoFormat = .hd1080p5994) {
         self.format = format
@@ -91,35 +135,27 @@ final class SyntheticCaptureSource: CaptureSource {
             supportsFormatDetection: false,
             isSynthetic: true
         )
-        queue = DispatchQueue(label: "synthetic-capture-\(index)", qos: .userInteractive)
     }
 
     func start() {
         stop()
-        let format = format
         let store = store
-        let buffer = UnsafeMutableRawBufferPointer.allocate(byteCount: format.frameBytes, alignment: 64)
-        let startNanos = DispatchTime.now().uptimeNanoseconds
-        var frameNumber: UInt64 = 0
-
-        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: queue)
-        let period = 1.0 / format.frameRate.doubleValue
-        timer.schedule(deadline: .now(), repeating: period, leeway: .microseconds(500))
-        timer.setEventHandler {
-            let elapsed = Double(DispatchTime.now().uptimeNanoseconds - startNanos) / 1_000_000_000
-            let due = UInt64(elapsed * format.frameRate.doubleValue)
-            frameNumber = max(frameNumber + 1, due)
-            SyntheticFrame.fill(buffer, format: format, frameNumber: frameNumber)
-            let timecode = Timecode(frameCount: Int(frameNumber), frameRate: format.frameRate)
-            store.offer(format: format, bytes: UnsafeRawPointer(buffer.baseAddress!), timecode: timecode, hasSignal: true)
+        let sink = sink
+        let source = SyntheticSource(
+            format: format,
+            audioChannels: audioChannels,
+            timecodeStart: Timecode.timeOfDay(date: Date(), frameRate: format.frameRate)
+        )
+        source.onFrame = { frame in
+            store.offer(format: frame.format, bytes: frame.video, timecode: frame.timecode, hasSignal: frame.hasSignal)
+            sink.send(frame)
         }
-        timer.setCancelHandler { buffer.deallocate() }
-        timer.resume()
-        self.timer = timer
+        source.start()
+        self.source = source
     }
 
     func stop() {
-        timer?.cancel()
-        timer = nil
+        source?.cancel()
+        source = nil
     }
 }

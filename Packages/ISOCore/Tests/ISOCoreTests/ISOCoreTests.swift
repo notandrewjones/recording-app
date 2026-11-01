@@ -118,6 +118,11 @@ import Testing
         #expect(args.filter { $0 == "-analyzeduration" }.count == 2)
     }
 
+    @Test func neverUsesNobufferBecauseItDropsTheFirstFrame() throws {
+        let args = try FFmpegCommand.recordArguments(config())
+        #expect(!args.contains { $0.contains("nobuffer") })
+    }
+
     @Test func probeFlagsPrecedeTheirInput() throws {
         let args = try FFmpegCommand.recordArguments(config(audio: nil))
         #expect(args.firstIndex(of: "-probesize")! < args.firstIndex(of: "-i")!)
@@ -172,8 +177,7 @@ import Testing
     }
 
     @Test func finalizeRestatesDropFrameTimecode() {
-        let tc = Timecode(hours: 1, minutes: 2, seconds: 3, frames: 4, nominalFPS: 60, isDropFrame: true)
-        let args = FFmpegCommand.finalizeArguments(input: "in.mov", output: "out.mov", startTimecode: tc)
+        let args = FFmpegCommand.finalizeArguments(input: "in.mov", output: "out.mov", startTimecode: "01:02:03;04")
         #expect(value(after: "-timecode", in: args) == "01:02:03;04")
         #expect(value(after: "-c", in: args) == "copy")
     }
@@ -303,6 +307,13 @@ import Testing
         #expect(dog.handle(.signalRestored) == [.startProcess(segment: 2)])
     }
 
+    @Test func recordingBeforeFirstFrameKeepsSegmentOne() {
+        var dog = RecorderWatchdog()
+        _ = dog.handle(.recordRequested)
+        _ = dog.handle(.noSignalYet)
+        #expect(dog.handle(.signalRestored) == [.startProcess(segment: 1)])
+    }
+
     @Test func formatChangeRollsSegmentImmediately() {
         var dog = recording()
         let actions = dog.handle(.formatChanged)
@@ -366,5 +377,91 @@ import Testing
     @Test func blockMovesAndWraps() {
         #expect(SyntheticFrame.movingBlockColumn(frameNumber: 0, width: 100, blockWidth: 10) == 0)
         #expect(SyntheticFrame.movingBlockColumn(frameNumber: 91, width: 100, blockWidth: 10) == 1)
+    }
+}
+
+@Suite struct AudioCadenceTests {
+    @Test func averagesExactlyOverTheNTSCCycle() {
+        let rate = Rational(60000, 1001)
+        let total = (0..<5).map { AudioCadence.sampleCount(forFrame: $0, frameRate: rate) }.reduce(0, +)
+        #expect(total == 4004)
+        #expect(Set((0..<5).map { AudioCadence.sampleCount(forFrame: $0, frameRate: rate) }) == [800, 801])
+    }
+
+    @Test func integerRatesAreConstant() {
+        #expect(AudioCadence.sampleCount(forFrame: 123, frameRate: Rational(50, 1)) == 960)
+    }
+
+    @Test func doesNotDriftOverADay() {
+        let frames: UInt64 = 5_178_816 // 24 hours at 59.94
+        let samples = AudioCadence.cumulativeSamples(throughFrames: frames, frameRate: Rational(60000, 1001))
+        #expect(samples == frames * 48_000 * 1001 / 60000)
+    }
+
+    @Test func maximumCoversEveryFrame() {
+        let rate = Rational(60000, 1001)
+        #expect((0..<1000).allSatisfy { AudioCadence.sampleCount(forFrame: UInt64($0), frameRate: rate) <= AudioCadence.maximumSamplesPerFrame(frameRate: rate) })
+    }
+}
+
+@Suite struct FrameGapTests {
+    func detector() -> FrameGapDetector {
+        FrameGapDetector(frameRate: Rational(60000, 1001), streamTimeScale: 240_000, maximumFill: 10)
+    }
+
+    @Test func consecutiveFramesAreContinuous() {
+        var gap = detector()
+        #expect(gap.observe(streamTime: 0) == .continuous)
+        #expect(gap.observe(streamTime: 4004) == .continuous)
+    }
+
+    @Test func countsMissingFrames() {
+        var gap = detector()
+        _ = gap.observe(streamTime: 0)
+        #expect(gap.observe(streamTime: 4004 * 4) == .missing(3))
+    }
+
+    @Test func largeJumpsAndBackwardsTimeBreakTheTimeline() {
+        var gap = detector()
+        _ = gap.observe(streamTime: 4004 * 100)
+        #expect(gap.observe(streamTime: 4004 * 200) == .discontinuity)
+        #expect(gap.observe(streamTime: 0) == .discontinuity)
+    }
+}
+
+@Suite struct TimeOfDayTimecodeTests {
+    @Test func countsFromMidnight() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        let date = Date(timeIntervalSince1970: 3600)
+        let tc = Timecode.timeOfDay(date: date, frameRate: Rational(50, 1), calendar: calendar)
+        #expect(tc.string == "01:00:00:00")
+    }
+
+    @Test func advanceKeepsMode() {
+        let tc = Timecode(frameCount: 10, nominalFPS: 60, isDropFrame: true).advanced(by: 5)
+        #expect(tc.frameCount == 15)
+        #expect(tc.isDropFrame)
+    }
+}
+
+@Suite struct SessionManifestTests {
+    @Test func roundTrips() throws {
+        var manifest = SessionManifest(name: "Game", createdAt: Date(timeIntervalSince1970: 1_000_000), createdAtHostNanos: 7)
+        var input = SessionManifest.InputRecord(id: "a", label: "Cam 1")
+        var segment = SessionManifest.SegmentRecord(number: 1, workingFile: "w", finalFile: "f", indexFile: "i", logFile: "l", format: .hd1080p5994, codec: .h264(megabitsPerSecond: 50), audioChannels: 16, startTimecode: "01:00:00;00", timecodeIsEmbedded: true, startHostNanos: 9)
+        segment.endReason = .signalLost
+        input.segments.append(segment)
+        manifest.inputs.append(input)
+        manifest.markers.append(.init(hostNanos: 3, label: "Goal"))
+        let data = try SessionManifest.encoder().encode(manifest)
+        #expect(try SessionManifest.decoder().decode(SessionManifest.self, from: data) == manifest)
+    }
+
+    @Test func pathsAreRelativeToTheSession() {
+        let layout = SessionLayout(rootPath: "/rec", sessionName: "S")
+        let relative = layout.relativePath("/rec/S/Cam/Cam_0001.mov")
+        #expect(relative == "Cam/Cam_0001.mov")
+        #expect(layout.absolutePath(relative) == "/rec/S/Cam/Cam_0001.mov")
     }
 }

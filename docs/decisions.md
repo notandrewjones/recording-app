@@ -20,6 +20,8 @@ Constraints found in testing:
   truncated a frame and corrupted the stream.
 - `sun_path` is 104 bytes on macOS and long paths are silently truncated, so sockets need a short directory.
 - Inputs need `-probesize 32 -analyzeduration 0`. Without them, ffmpeg took over 5 s to create the file.
+- `-fflags +nobuffer` must not be used. It silently discards the first frame, confirmed by per-frame MD5,
+  which would put every file one frame out against its index.
 - ffmpeg paces on its slowest input, so audio and video writers must be independent.
 
 ## Capacity on the M2 Pro
@@ -65,3 +67,24 @@ ffmpeg's demuxer rejects `32c` and `64c`, and no target card exceeds 16 embedded
 ## Free-running sources, host time as the shared timeline
 
 Current sources are not genlocked. The model does not assume they are, and needs no changes if they are.
+
+## The engine is a separate library with a CLI
+
+There is no capture hardware to test with yet. Keeping the engine free of the SDK means its tests cover
+gap filling, format changes, signal loss, killed and hung ffmpeg, and app crashes against real ffmpeg.
+
+## Frame count over timestamps, with repeats for gaps
+
+File frame N must equal index record N, or the replay timeline falls apart. Repeating the previous frame
+keeps that true through short drops at the cost of a visible hold, and the index flags every repeat.
+
+## The ring survives a recorder crash
+
+Reusing it means frames captured but not yet written carry into the next segment. Only what ffmpeg
+held in memory at the crash is lost, which is bounded by its queue and the last fragment.
+
+## Working files are deleted only after verification
+
+A closed segment temporarily takes twice its size during the remux. The frame count of the result must
+match the working file first. This matters on a small drive, so a segment with too little room for
+the copy stays as a working file rather than risking the recording.

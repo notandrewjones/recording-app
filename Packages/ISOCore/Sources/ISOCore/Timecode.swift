@@ -29,6 +29,17 @@ public struct Timecode: Hashable, Codable, Sendable {
         self.init(frameCount: frameCount, nominalFPS: nominal, isDropFrame: drop)
     }
 
+    /// Time-of-day timecode, used when the signal carries none.
+    public static func timeOfDay(date: Date, frameRate: Rational, calendar: Calendar = .current) -> Timecode {
+        let midnight = calendar.startOfDay(for: date)
+        let seconds = date.timeIntervalSince(midnight)
+        return Timecode(frameCount: Int(seconds * frameRate.doubleValue), frameRate: frameRate)
+    }
+
+    public func advanced(by frames: Int) -> Timecode {
+        Timecode(frameCount: frameCount + frames, nominalFPS: nominalFPS, isDropFrame: isDropFrame)
+    }
+
     public var components: (hours: Int, minutes: Int, seconds: Int, frames: Int) {
         var count = frameCount
         if isDropFrame {

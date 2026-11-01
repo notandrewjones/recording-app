@@ -1,4 +1,5 @@
 import ISOCore
+import ISOEngine
 import SwiftUI
 
 @main
@@ -13,6 +14,13 @@ struct ISORecorderApp: App {
         }
         .windowStyle(.hiddenTitleBar)
         .commands {
+            CommandMenu("Record") {
+                Button(model.isRecording ? "Stop All" : "Record All") { model.toggleRecordAll() }
+                    .keyboardShortcut("r", modifiers: [.command])
+                Button("Add Marker") { model.addMarker() }
+                    .keyboardShortcut("m", modifiers: [.command])
+                    .disabled(!model.isRecording)
+            }
             CommandMenu("Inputs") {
                 Button("Add Synthetic Input") { model.addSyntheticInput() }
                     .keyboardShortcut("n", modifiers: [.command, .shift])
@@ -30,6 +38,7 @@ private enum Palette {
     static let secondary = Color(white: 0.62)
     static let locked = Color(red: 0.25, green: 0.80, blue: 0.40)
     static let warning = Color(red: 0.95, green: 0.70, blue: 0.20)
+    static let tally = Color(red: 0.90, green: 0.12, blue: 0.14)
 }
 
 struct MultiviewScreen: View {
@@ -59,7 +68,7 @@ struct MultiviewScreen: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            StatusBar(inputCount: model.tiles.count, driverStatus: model.driverStatus)
+            StatusBar(model: model)
         }
         .background(Palette.background)
     }
@@ -101,8 +110,10 @@ struct InputTileView: View {
         }
         .overlay(alignment: .top) { header }
         .overlay(alignment: .bottom) { footer }
-        .overlay(Rectangle().stroke(Palette.line, lineWidth: 1))
+        .overlay(Rectangle().stroke(tile.isRecording ? Palette.tally : Palette.line, lineWidth: tile.isRecording ? 3 : 1))
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .contentShape(Rectangle())
+        .onTapGesture { if !tile.isRecording { tile.isArmed.toggle() } }
     }
 
     private var overlayMessage: String? {
@@ -120,6 +131,14 @@ struct InputTileView: View {
                 .fill(tile.status.signal.format == nil ? Palette.warning : Palette.locked)
                 .frame(width: 8, height: 8)
             Text(tile.source.input.displayName).fontWeight(.semibold)
+            if tile.isRecording {
+                Text("REC")
+                    .fontWeight(.bold)
+                    .padding(.horizontal, 5)
+                    .background(Palette.tally)
+            } else if tile.isArmed {
+                Text("ARMED").foregroundStyle(Palette.tally)
+            }
             Spacer()
             Text(tile.status.signal.format?.displayName ?? "--")
         }
@@ -130,10 +149,20 @@ struct InputTileView: View {
         HStack {
             Text(tile.status.timecode?.string ?? "--:--:--:--")
             Spacer()
+            if let recorder = tile.recorderStatus, tile.isRecording {
+                Text(recorderSummary(recorder))
+            }
             Text(String(format: "%.2f fps", tile.measuredFPS))
         }
         .modifier(TileStrip())
     }
+}
+
+private func recorderSummary(_ status: InputRecorderStatus) -> String {
+    var parts = ["seg \(status.segment ?? 0)", "\(status.totalFrames) f"]
+    if status.repeatedFrames > 0 { parts.append("\(status.repeatedFrames) rpt") }
+    if status.restarts > 0 { parts.append("\(status.restarts) restart\(status.restarts == 1 ? "" : "s")") }
+    return parts.joined(separator: " · ")
 }
 
 private struct TileStrip: ViewModifier {
@@ -147,14 +176,21 @@ private struct TileStrip: ViewModifier {
 }
 
 struct StatusBar: View {
-    let inputCount: Int
-    let driverStatus: String
+    @ObservedObject var model: AppModel
 
     var body: some View {
         HStack(spacing: 16) {
-            Text("\(inputCount) input\(inputCount == 1 ? "" : "s")")
+            Text("\(model.tiles.count) input\(model.tiles.count == 1 ? "" : "s")")
+            if model.isRecording {
+                Text("RECORDING").foregroundStyle(Palette.tally).fontWeight(.bold)
+            } else if model.isFinalizing {
+                Text("FINALIZING").foregroundStyle(Palette.warning)
+            }
+            if let message = model.message {
+                Text(message).lineLimit(1)
+            }
             Spacer()
-            Text(driverStatus)
+            Text(model.driverStatus)
         }
         .font(.system(size: 11, design: .monospaced))
         .foregroundStyle(Palette.secondary)

@@ -19,6 +19,9 @@ targets:
       - Bridge
     dependencies:
       - package: ISOCore
+        product: ISOCore
+      - package: ISOCore
+        product: ISOEngine
     settings:
       base:
         PRODUCT_NAME: ISORecorder

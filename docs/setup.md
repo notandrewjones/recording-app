@@ -30,6 +30,17 @@ build/Build/Products/Debug/ISORecorder.app/Contents/MacOS/ISORecorder
 
 Pass `-synthetic 4` to start with four generated inputs. Inputs > Add Synthetic Input (⇧⌘N) adds more.
 
+Recordings go to `~/Movies/ISO Recorder`. Change this with
+`defaults write com.notandrewjones.ISORecorder recordingRoot /path`.
+
+## Record without the app
+
+```sh
+cd Packages/ISOCore
+swift run isorec record --root /path/to/recordings --inputs 2 --seconds 30 --codec hq
+swift run isorec recover /path/to/recordings/<session>
+```
+
 ## Run tests
 
 ```sh
@@ -38,7 +49,13 @@ cd Packages/ISOCore && swift test
 
 ## ffmpeg
 
-The Homebrew path is the default for now. A user-configured path arrives with recording in M2.
+The app looks for `/opt/homebrew/bin/ffmpeg`, then `/usr/local/bin/ffmpeg`. To use another build:
+
+```sh
+defaults write com.notandrewjones.ISORecorder ffmpegPath /path/to/ffmpeg
+```
+
+It refuses to record unless the build has `prores_videotoolbox`.
 
 Bundling a static build later:
 

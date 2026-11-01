@@ -21,6 +21,8 @@ public struct RecorderWatchdog: Hashable, Sendable {
         /// No output growth for longer than the stall threshold.
         case outputStalled
         case signalLost
+        /// Recording was requested before any valid frame arrived, so the segment number is still unused.
+        case noSignalYet
         case signalRestored
         case formatChanged
         case backoffElapsed
@@ -67,6 +69,10 @@ public struct RecorderWatchdog: Hashable, Sendable {
             state = .waitingForSignal(nextSegment: segment + 1)
             nextSegment = segment + 1
             return [.stopProcess, .log("signal lost, closed segment \(segment)")]
+
+        case (.starting(let segment), .noSignalYet):
+            state = .waitingForSignal(nextSegment: segment)
+            return []
 
         case (.recording(let segment), .formatChanged), (.starting(let segment), .formatChanged):
             nextSegment = segment + 1

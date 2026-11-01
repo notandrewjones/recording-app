@@ -86,19 +86,21 @@ public enum FFmpegCommand {
 
     /// Lossless remux of a fragmented segment to a standard MOV. Timecode must be passed again:
     /// a stream copy keeps the frame count but loses the drop-frame flag.
-    public static func finalizeArguments(input: String, output: String, startTimecode: Timecode) -> [String] {
+    public static func finalizeArguments(input: String, output: String, startTimecode: String) -> [String] {
         [
             "-hide_banner", "-loglevel", "warning", "-nostats", "-y",
             "-i", input,
             "-map", "0:v", "-map", "0:a?",
             "-c", "copy",
-            "-timecode", startTimecode.string,
+            "-timecode", startTimecode,
             "-movflags", "+faststart",
             output,
         ]
     }
 
-    private static let noProbeArguments = ["-fflags", "+nobuffer", "-probesize", "32", "-analyzeduration", "0"]
+    /// Without these, ffmpeg spends seconds probing a raw input before it opens the output.
+    /// Do not add `-fflags +nobuffer`: it discards the first frame, which breaks frame N = index record N.
+    private static let noProbeArguments = ["-probesize", "32", "-analyzeduration", "0"]
 
     private static func validate(socketPath: String) throws {
         if socketPath.utf8.count > maxSocketPathBytes {
