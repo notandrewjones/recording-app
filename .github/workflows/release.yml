@@ -1,0 +1,113 @@
+name: Release
+
+# Builds, signs, notarizes and staples ISORecorder.dmg. A v* tag also publishes it as a GitHub Release;
+# a manual run leaves the .dmg as a workflow artifact. Set the secrets with scripts/ci-set-github-secrets.sh.
+# See docs/release.md.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    env:
+      ISO_SIGN_IDENTITY: "Developer ID Application"
+      ISO_DEVELOPMENT_TEAM: ${{ secrets.APPLE_TEAM_ID }}
+      NOTARY_PROFILE: ISORecorder-Notary
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # tags and commit count set the version
+
+      - name: Select latest installed Xcode
+        run: |
+          set -euo pipefail
+          XC="$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1 || true)"
+          [ -z "$XC" ] && XC="/Applications/Xcode.app"
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          "$XC/Contents/Developer/usr/bin/xcodebuild" -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Run unit tests
+        # The integration tests need real-time ffmpeg and hardware ProRes, which runner VMs lack.
+        run: swift test --package-path Packages/ISOCore --filter 'ISOCoreTests|FrameRingTests'
+
+      - name: Import Developer ID signing certificate
+        env:
+          CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          [ -n "$CERT_P12_BASE64" ] || { echo "::error::Signing secrets are missing. Run scripts/ci-set-github-secrets.sh."; exit 1; }
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KC_PW="$(openssl rand -base64 24)"
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+
+          echo "$CERT_P12_BASE64" | base64 --decode > "$CERT_PATH"
+
+          security create-keychain -p "$KC_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KC_PW" "$KEYCHAIN"
+
+          security import "$CERT_PATH" -P "$CERT_PASSWORD" \
+            -f pkcs12 -A -t cert -k "$KEYCHAIN" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          # Lets codesign use the key without a prompt.
+          security set-key-partition-list -S apple-tool:,apple: -k "$KC_PW" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+
+          rm -f "$CERT_PATH"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+      - name: Register notarization credentials
+        env:
+          NOTARY_KEY_P8_BASE64: ${{ secrets.NOTARY_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          KEY_PATH="$RUNNER_TEMP/notary.p8"
+          echo "$NOTARY_KEY_P8_BASE64" | base64 --decode > "$KEY_PATH"
+          xcrun notarytool store-credentials "$NOTARY_PROFILE" \
+            --key "$KEY_PATH" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER_ID" \
+            --keychain "$KEYCHAIN"
+          rm -f "$KEY_PATH"
+
+      - name: Build signed app
+        run: ./scripts/build_release.sh
+
+      - name: Notarize, staple and package .dmg
+        run: ./scripts/notarize.sh
+
+      - name: Verify Gatekeeper acceptance
+        run: |
+          spctl -a -vvv -t exec build/export/ISORecorder.app
+          spctl -a -vvv -t open --context context:primary-signature build/ISORecorder.dmg
+
+      - name: Keep .dmg as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ISORecorder-dmg
+          path: build/ISORecorder.dmg
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/ISORecorder.dmg
+          prerelease: ${{ startsWith(github.ref_name, 'v0.') || contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true

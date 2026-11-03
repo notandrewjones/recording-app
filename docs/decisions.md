@@ -211,3 +211,12 @@ which carry the time of the frame that ended the gap. It now measures to the las
 
 The two-hour run still has to be repeated on mains power.
 
+## DeckLink headers are vendored and library validation is off in release builds
+
+CI has no SDK download, and GitHub secrets are too small to hold it. The headers' own licence allows
+redistribution and the SDK EULA's clause 0 exempts them, so `Mac/include` lives in `Vendor/DeckLinkSDK`.
+
+Hardened runtime refuses a framework signed by another team, and Desktop Video installs
+`DeckLinkAPI.framework` under Blackmagic's. `build_release.sh` fails if the entitlement is missing, because
+the app would still launch but find no cards. A notarized 0.4.0 build loaded the framework and recorded two
+synthetic inputs through Homebrew ffmpeg. It has not been tried with a capture card.

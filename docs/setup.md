@@ -9,16 +9,13 @@
 
 ## DeckLink SDK
 
-The SDK is proprietary and is not in this repo.
+The SDK's `Mac/include` folder is vendored in `Vendor/DeckLinkSDK`, so nothing needs downloading to build.
+To build against another SDK, copy `Config/Local.xcconfig.example` to `Config/Local.xcconfig` and set
+`DECKLINK_SDK_PATH` to the folder containing `Mac/include`.
 
-1. Download the Desktop Video SDK from the [Blackmagic support centre](https://www.blackmagicdesign.com/support).
-2. Extract it anywhere.
-3. Copy `Config/Local.xcconfig.example` to `Config/Local.xcconfig` and set `DECKLINK_SDK_PATH` to the
-   extracted folder, the one containing `Mac/include`.
-
-The build uses these files from `Mac/include`: `DeckLinkAPI.h`, the `DeckLinkAPI*.h` headers it includes,
-`DeckLinkAPIVersion.h` and `DeckLinkAPIDispatch.cpp`. Nothing from the SDK is copied or linked statically.
-`DeckLinkAPIDispatch.cpp` loads `/Library/Frameworks/DeckLinkAPI.framework` at runtime, which Desktop Video installs.
+The build uses `DeckLinkAPI.h`, the `DeckLinkAPI*.h` headers it includes, `DeckLinkAPIVersion.h` and
+`DeckLinkAPIDispatch.cpp`. `DeckLinkAPIDispatch.cpp` loads `/Library/Frameworks/DeckLinkAPI.framework` at
+runtime, which Desktop Video installs.
 
 ## Build and run
 
@@ -119,6 +116,6 @@ Bundling a static build later:
 
 ## Distribution notes
 
-The app is unsandboxed. A hardened-runtime build needs
-`com.apple.security.cs.disable-library-validation` so it can load Blackmagic's framework. This is not
-exercised yet because the development build has hardened runtime off.
+See [release.md](release.md). Release builds use the hardened runtime and are unsandboxed, with
+`com.apple.security.cs.disable-library-validation` so they can load Blackmagic's framework. Debug builds
+are ad-hoc signed with hardened runtime off.

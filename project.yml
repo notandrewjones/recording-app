@@ -34,8 +34,18 @@ targets:
         CURRENT_PROJECT_VERSION: "1"
         ENABLE_APP_SANDBOX: NO
         ENABLE_HARDENED_RUNTIME: NO
-        CODE_SIGN_IDENTITY: "-"
+        # scripts/build_release.sh overrides these two with the Developer ID values.
+        ISO_SIGN_IDENTITY: "-"
+        ISO_DEVELOPMENT_TEAM: ""
+        CODE_SIGN_IDENTITY: "$(ISO_SIGN_IDENTITY)"
+        DEVELOPMENT_TEAM: "$(ISO_DEVELOPMENT_TEAM)"
         CODE_SIGN_STYLE: Manual
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CLANG_ENABLE_OBJC_ARC: YES
         CLANG_CXX_LANGUAGE_STANDARD: c++17
         HEADER_SEARCH_PATHS: "\"$(DECKLINK_SDK_PATH)/Mac/include\""
+      configs:
+        Release:
+          ENABLE_HARDENED_RUNTIME: YES
+          CODE_SIGN_ENTITLEMENTS: App/ISORecorder.entitlements
+          ARCHS: arm64

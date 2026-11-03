@@ -8,3 +8,4 @@ Config/Local.xcconfig
 *.mov
 *.idx
 /build/
+scripts/signing.env
