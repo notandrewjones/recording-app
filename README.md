@@ -6,6 +6,7 @@ Each input is recorded to its own file. Multi-angle replay is planned for phase 
 - [Setup](docs/setup.md)
 - [Architecture](docs/architecture.md)
 - [Decisions log](docs/decisions.md)
+- [Soak test checklist](docs/soak-test.md)
 
 ```sh
 xcodegen generate

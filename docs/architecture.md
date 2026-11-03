@@ -61,6 +61,10 @@ An input that arrives mid-session joins it, and one that returns reattaches to i
   rate while recording, and the estimate for armed inputs when idle.
 - **Per input:** segment, frames, repeats, gaps and restarts.
 
+A session also writes `health.jsonl`, one sample every 5 seconds. `SessionReport` reads it with the manifest
+and the frame indexes to give a PASS or FAIL, through `isorec report`. A diagnostics bundle adds system
+details and ffmpeg logs in a zip, never media. See `docs/soak-test.md`.
+
 ## Capture and formats
 
 Each input starts at 1080p59.94 with format detection enabled. On a change, the callback follows the

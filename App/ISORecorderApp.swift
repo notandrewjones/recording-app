@@ -52,6 +52,9 @@ struct ISORecorderApp: App {
                 Button("Add Marker") { model.addMarker() }
                     .keyboardShortcut("m", modifiers: [.command])
                     .disabled(!model.isRecording)
+                Divider()
+                Button("Export Diagnostics") { model.exportDiagnostics() }
+                    .keyboardShortcut("e", modifiers: [.command, .shift])
             }
             CommandMenu("Inputs") {
                 Button("Add Synthetic Input") { model.addSyntheticInput() }

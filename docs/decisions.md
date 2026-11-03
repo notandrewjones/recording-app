@@ -191,3 +191,23 @@ dependable multicam form, so Premiere gets aligned tracks. A CMX EDL has one vid
 Companion's generic HTTP module can drive it with no custom module. A local server is reachable from any web
 page, so it binds to loopback and refuses `Origin` headers and non-local `Host` values. WebSocket and OSC can
 be added later without changing the commands.
+
+## Soak result so far: 77 clean minutes, then a crash that is now fixed
+
+Five synthetic HEVC inputs at 4 Mb/s ran for 79 minutes of a planned 121, on battery by mistake.
+
+- 0 repeated frames for the first 77 minutes, and app memory stayed flat at about 1.7 GB.
+- At 77 minutes, with the battery near 5%, all five encoders slowed together and rings stayed full for
+  two minutes. Low battery is the likely cause, but this is not proven. A one-sample blip to 92% at
+  45 minutes has no explanation yet.
+- At 79 minutes the process trapped: a frame arrived between `monitorTick` reading the clock and taking
+  the lock, so `now - lastIngestUptime` went negative. This could happen in any recording, at any time.
+  Time differences now go through `HostTime.seconds`, which cannot trap.
+- Recovery restored all five inputs, 1,405,296 frames, in 86 seconds. Clock drift at the last real frame
+  was 0.32 frames or less on every input.
+
+The report showed drift of up to 372 frames because the crash stopped partway through runs of repeats,
+which carry the time of the frame that ended the gap. It now measures to the last real frame.
+
+The two-hour run still has to be repeated on mains power.
+

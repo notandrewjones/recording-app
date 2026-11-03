@@ -527,6 +527,40 @@ import Testing
     }
 }
 
+@Suite(.serialized) struct DiagnosticsTests {
+    @Test func reportAndBundleCoverARealSession() throws {
+        let environment = try FFmpegEnvironment.locate()
+        let root = (NSTemporaryDirectory() as NSString).appendingPathComponent("isorec-diag-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: root) }
+
+        let session = try RecordingSession(rootPath: root, name: "diag", environment: environment, healthIntervalSeconds: 0.5)
+        let recorder = session.addInput(id: "cam", label: "Cam", settings: InputRecorderSettings(audio: AudioFormat(channels: 2), fullSyncSeconds: 0))
+        let source = SyntheticSource(audioChannels: 2)
+        source.onFrame = { recorder.ingest($0) }
+        source.start()
+        Thread.sleep(forTimeInterval: 0.1)
+        session.startAll()
+        Thread.sleep(forTimeInterval: 3)
+        session.stopAll()
+        source.cancel()
+        session.waitUntilFinished()
+
+        let directory = session.layout.sessionDirectory
+        let report = try SessionAnalysis.report(directory: directory)
+        #expect(report.passed, "\(report.text)")
+        #expect(report.summary.contains { $0.contains("Worst clock drift") })
+
+        let archive = try DiagnosticsBundle.write(sessionDirectory: directory, environment: environment, settings: "{}", destinationDirectory: root)
+        let listing = try ProcessRunner.run("/usr/bin/unzip", ["-l", archive]).output
+        for name in ["session.json", "health.jsonl", "report.txt", "system.txt", "output-settings.json", "Cam_0001.log"] {
+            #expect(listing.contains(name), "\(name)")
+        }
+        #expect(!listing.contains(".mov"))
+        #expect(!listing.contains(".idx"))
+    }
+}
+
 final class UnfairLockedArray: @unchecked Sendable {
     private let lock = UnfairLock()
     private var stored: [ControlCommand] = []

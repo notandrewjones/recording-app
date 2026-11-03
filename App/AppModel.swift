@@ -275,6 +275,43 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Zips logs for the newest session and shows the result. Never includes media.
+    func exportDiagnostics() {
+        guard let latest = latestSessionDirectory() else {
+            message = "No session to export."
+            return
+        }
+        let environment = environment
+        let settings = (try? JSONEncoder().encode(outputSettings.defaults)).map { String(decoding: $0, as: UTF8.self) }
+        let destination = (NSHomeDirectory() as NSString).appendingPathComponent("Desktop")
+        message = "Exporting diagnostics…"
+        DispatchQueue.global(qos: .utility).async {
+            let result = Result {
+                try DiagnosticsBundle.write(sessionDirectory: latest, environment: environment, settings: settings, destinationDirectory: destination)
+            }
+            Task { @MainActor [weak self] in
+                switch result {
+                case .success(let path): self?.message = "Diagnostics saved to \(path)"
+                case .failure(let error): self?.message = "Could not export diagnostics: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    private func latestSessionDirectory() -> String? {
+        let manager = FileManager.default
+        let names = (try? manager.contentsOfDirectory(atPath: recordingRoot)) ?? []
+        return names
+            .map { (recordingRoot as NSString).appendingPathComponent($0) }
+            .filter { SessionRecovery.load(directory: $0) != nil }
+            .max { modificationDate($0) < modificationDate($1) }
+    }
+
+    private func modificationDate(_ path: String) -> Date {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+        return attributes?[.modificationDate] as? Date ?? .distantPast
+    }
+
     func addMarker() {
         session?.addMarker(label: "Marker")
     }

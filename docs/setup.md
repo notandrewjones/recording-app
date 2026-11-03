@@ -67,6 +67,19 @@ Each session writes `export/` when it finishes:
 Rerun with `isorec export <session>`, for example after moving the session folder, because exports use
 absolute paths.
 
+## Check a recording
+
+Each session writes `health.jsonl` every 5 seconds while recording. To get a pass or fail, or a zip of logs
+to send to someone, use Record > Export Diagnostics in the app, or:
+
+```sh
+cd Packages/ISOCore
+swift run -c release isorec report "/path/to/session"
+swift run -c release isorec diagnose "/path/to/session" --to ~/Desktop
+```
+
+See [the soak test checklist](soak-test.md).
+
 ## Record without the app
 
 ```sh

@@ -10,6 +10,8 @@ import ISOEngine
 //                 [--kbps N] [--max-kbps N] [--quality N] [--keyframe S] [--preset NAME] [--chroma422]
 //   isorec recover DIR
 //   isorec export DIR
+//   isorec report DIR
+//   isorec diagnose DIR [--to DIR]
 
 func option(_ name: String) -> String? {
     guard let index = CommandLine.arguments.firstIndex(of: name), index + 1 < CommandLine.arguments.count else { return nil }
@@ -134,6 +136,9 @@ case "record":
         let status = recorder.status()
         print("\(recorder.label): frames=\(status.totalFrames) repeated=\(status.repeatedFrames) restarts=\(status.restarts) gap=\(status.gapFrames) peakRing=\(Int(status.peakRingFill * 100))%")
     }
+    if let report = try? SessionAnalysis.report(directory: session.layout.sessionDirectory) {
+        print(report.text, terminator: "")
+    }
     print(String(format: "machine: peakCPU=%.0f%% memoryPressure=%@ write=%.0f MB/s", peakCPU * 100, String(describing: worstPressure), liveRate / 1_000_000))
 
 case "recover":
@@ -153,6 +158,25 @@ case "export":
         fail("Could not export: \(error)")
     }
 
+case "report":
+    guard CommandLine.arguments.count > 2 else { fail("report needs a session directory") }
+    do {
+        let report = try SessionAnalysis.report(directory: CommandLine.arguments[2])
+        print(report.text, terminator: "")
+        exit(report.passed ? 0 : 2)
+    } catch {
+        fail("Could not read the session: \(error)")
+    }
+
+case "diagnose":
+    guard CommandLine.arguments.count > 2 else { fail("diagnose needs a session directory") }
+    let directory = CommandLine.arguments[2]
+    do {
+        print(try DiagnosticsBundle.write(sessionDirectory: directory, environment: environment, destinationDirectory: option("--to") ?? (directory as NSString).deletingLastPathComponent))
+    } catch {
+        fail("Could not write diagnostics: \(error)")
+    }
+
 default:
-    fail("usage: isorec record --root DIR [--inputs N] [--seconds S] | isorec recover DIR | isorec export DIR")
+    fail("usage: isorec record --root DIR [--inputs N] [--seconds S] | isorec recover DIR | isorec export DIR | isorec report DIR | isorec diagnose DIR")
 }

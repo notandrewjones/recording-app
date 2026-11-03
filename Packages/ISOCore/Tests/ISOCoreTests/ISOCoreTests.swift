@@ -815,3 +815,90 @@ import Testing
         #expect(text.contains("Connection: close"))
     }
 }
+
+@Suite struct SessionReportTests {
+    func manifest(repeated: Int = 0, lost: Int = 0, state: SessionManifest.SegmentState = .finalized, end: SessionManifest.EndReason = .stopped) -> SessionManifest {
+        var manifest = SessionManifest(name: "Soak", createdAt: Date(timeIntervalSince1970: 0), createdAtHostNanos: 0)
+        var input = SessionManifest.InputRecord(id: "a", label: "Cam 1")
+        var segment = SessionManifest.SegmentRecord(number: 1, workingFile: "w", finalFile: "f", indexFile: "i", logFile: "l", format: .hd1080p5994, codec: .proResLT, audioChannels: 2, startTimecode: "00:00:00;00", timecodeIsEmbedded: false, startHostNanos: 0)
+        segment.frames = 1000
+        segment.repeatedFrames = repeated
+        segment.lostFrames = lost
+        segment.state = state
+        segment.endReason = end
+        input.segments = [segment]
+        manifest.inputs = [input]
+        return manifest
+    }
+
+    func sample(_ seconds: Double, app: UInt64 = 1_000_000_000, ring: Double = 0.1, pressure: Int = 1) -> HealthSample {
+        HealthSample(seconds: seconds, cpu: 0.4, memoryPressure: pressure, memoryUsedBytes: 0, appResidentBytes: app, ffmpegResidentBytes: 2_000_000_000, freeBytes: 0, writeBytesPerSecond: 0, inputs: [.init(id: "a", ringFill: ring, frames: 0, repeatedFrames: 0, restarts: 0)])
+    }
+
+    func steadyHealth() -> [HealthSample] {
+        (0..<100).map { sample(Double($0) * 10) }
+    }
+
+    @Test func cleanRunPasses() {
+        let report = SessionReport(manifest: manifest(), health: steadyHealth(), timings: [])
+        #expect(report.passed)
+        #expect(report.findings.isEmpty)
+        #expect(report.text.hasPrefix("RESULT: PASS"))
+    }
+
+    @Test(arguments: [
+        (1, 0, SessionManifest.SegmentState.finalized, SessionManifest.EndReason.stopped),
+        (0, 1, .finalized, .stopped),
+        (0, 0, .finalizeFailed, .stopped),
+        (0, 0, .finalized, .recorderFailed),
+    ])
+    func anythingAViewerWouldNoticeFails(repeated: Int, lost: Int, state: SessionManifest.SegmentState, end: SessionManifest.EndReason) {
+        #expect(!SessionReport(manifest: manifest(repeated: repeated, lost: lost, state: state, end: end), health: steadyHealth(), timings: []).passed)
+    }
+
+    @Test func clockDriftFails() {
+        let timing = SegmentTiming(inputLabel: "Cam 1", number: 1, records: 1000, firstHostNanos: 0, lastHostNanos: 18_000_000_000, frameRate: Rational(60000, 1001))
+        #expect(timing.driftFrames > 2)
+        #expect(!SessionReport(manifest: manifest(), health: steadyHealth(), timings: [timing]).passed)
+    }
+
+    @Test func accurateClockPasses() {
+        let timing = SegmentTiming(inputLabel: "Cam 1", number: 1, records: 60001, firstHostNanos: 0, lastHostNanos: 1_001_000_000_000, frameRate: Rational(60000, 1001))
+        #expect(abs(timing.driftFrames) < 0.01)
+    }
+
+    @Test func repeatsCutShortByACrashDoNotCountAsDrift() {
+        // The last real frame is number 60000. A crash then left 500 of the repeats before it on disk,
+        // stamped with the time of a frame 2000 later that never reached the file.
+        let timing = SegmentTiming(inputLabel: "Cam 1", number: 1, records: 60501, firstHostNanos: 0, lastHostNanos: 1_000_000_000_000, frameRate: Rational(60, 1), trailingRepeats: 500)
+        #expect(abs(timing.driftFrames) < 0.01)
+    }
+
+    @Test func elapsedHostTimeNeverGoesNegative() {
+        #expect(HostTime.seconds(from: 1_000_000_000, to: 3_000_000_000) == 2)
+        #expect(HostTime.seconds(from: 3_000_000_000, to: 1_000_000_000) == 0)
+    }
+
+    @Test func memoryLeakWarnsWithoutFailing() {
+        let leaking = (0..<100).map { sample(Double($0) * 10, app: 1_000_000_000 + UInt64($0) * 20_000_000) }
+        let report = SessionReport(manifest: manifest(), health: leaking, timings: [])
+        #expect(report.passed)
+        #expect(report.findings.contains { $0.message.contains("App memory grew") })
+    }
+
+    @Test func briefSpikeIsNotALeak() {
+        var health = steadyHealth()
+        health[50] = sample(500, app: 9_000_000_000)
+        #expect(SessionReport(manifest: manifest(), health: health, timings: []).findings.isEmpty)
+    }
+
+    @Test func nearFullRingAndCriticalMemoryWarn() {
+        var health = steadyHealth()
+        health[10] = sample(100, ring: 0.95, pressure: 4)
+        #expect(SessionReport(manifest: manifest(), health: health, timings: []).findings.count == 2)
+    }
+
+    @Test func missingHealthIsNoted() {
+        #expect(SessionReport(manifest: manifest(), health: [], timings: []).findings.first?.severity == .warning)
+    }
+}

@@ -15,11 +15,14 @@ public final class RecordingSession: @unchecked Sendable {
     private let healthLock = UnfairLock()
     private var storageLevel = StoragePolicy.Level.ok
     private var writeBytesPerSecond = 0.0
+    private var healthLog: HealthLog?
+    private var healthTicks = 0
+    private let healthIntervalTicks: Int
 
     /// Called once if recording stops itself because the drive is nearly full.
     public var onStoppedForDiskSpace: (() -> Void)?
 
-    public init(rootPath: String, name: String? = nil, environment: FFmpegEnvironment, storagePolicy: StoragePolicy = StoragePolicy()) throws {
+    public init(rootPath: String, name: String? = nil, environment: FFmpegEnvironment, storagePolicy: StoragePolicy = StoragePolicy(), healthIntervalSeconds: Double = 5) throws {
         let now = Date()
         layout = SessionLayout(rootPath: rootPath, sessionName: name ?? SessionLayout.defaultSessionName(date: now))
         store = try SessionStore(layout: layout, manifest: SessionManifest(
@@ -29,6 +32,7 @@ public final class RecordingSession: @unchecked Sendable {
         ))
         self.environment = environment
         self.storagePolicy = storagePolicy
+        healthIntervalTicks = max(1, Int(healthIntervalSeconds * 2))
         finalizer = Finalizer(environment: environment)
 
         // Sockets live under /tmp because a path inside the session could exceed the 104-byte limit.
@@ -58,6 +62,7 @@ public final class RecordingSession: @unchecked Sendable {
 
     public func startAll() {
         recorders.forEach { $0.startRecording() }
+        healthLog = HealthLog(sessionDirectory: layout.sessionDirectory)
         startStorageGuard()
     }
 
@@ -83,10 +88,15 @@ public final class RecordingSession: @unchecked Sendable {
     /// Stops with room to spare. A drive that fills completely fails every input at once, mid-fragment.
     private func checkStorage() {
         let rate = recorders.map { $0.status().bytesPerSecond }.reduce(0, +)
-        let level = storagePolicy.evaluate(freeBytes: SystemMetrics.freeBytes(at: layout.sessionDirectory), writeBytesPerSecond: rate)
+        let free = SystemMetrics.freeBytes(at: layout.sessionDirectory)
+        let level = storagePolicy.evaluate(freeBytes: free, writeBytesPerSecond: rate)
         healthLock.withLock {
             storageLevel = level
             writeBytesPerSecond = rate
+        }
+        healthTicks += 1
+        if healthTicks % healthIntervalTicks == 0 {
+            healthLog?.record(recorders: recorders, freeBytes: free, writeBytesPerSecond: rate)
         }
         guard level == .critical else { return }
 

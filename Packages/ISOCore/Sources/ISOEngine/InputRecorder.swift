@@ -350,7 +350,7 @@ public final class InputRecorder: @unchecked Sendable {
 
     private func recordOpening(_ opening: SegmentRecorder.Opening, number: Int, format: VideoFormat, configuration: SegmentRecorder.Configuration) {
         if let failedAt = failedAtHostNanos, opening.startHostNanos > failedAt {
-            let lost = max(0, Int((seconds(opening.startHostNanos - failedAt) * format.frameRate.doubleValue).rounded()) - 1)
+            let lost = max(0, Int((HostTime.seconds(from: failedAt, to: opening.startHostNanos) * format.frameRate.doubleValue).rounded()) - 1)
             gapFrames += lost
             log("recording_gap", detail: "\(lost) frames")
         }
@@ -455,7 +455,7 @@ public final class InputRecorder: @unchecked Sendable {
         let now = DispatchTime.now().uptimeNanoseconds
 
         let (sinceIngest, wasReceiving, queued, fill) = lock.withLock {
-            (seconds(now - lastIngestUptime), lastSignal == true, ring?.queuedFrames ?? 0, ring?.fillLevel ?? 0)
+            (HostTime.seconds(from: lastIngestUptime, to: now), lastSignal == true, ring?.queuedFrames ?? 0, ring?.fillLevel ?? 0)
         }
         peakRingFill = max(peakRingFill, fill)
         if wasReceiving, sinceIngest > settings.signalTimeoutSeconds {
@@ -466,7 +466,7 @@ public final class InputRecorder: @unchecked Sendable {
         guard let current else { return }
 
         let bytes = current.bytesOnDisk
-        let elapsed = seconds(now - lastSampleUptime)
+        let elapsed = HostTime.seconds(from: lastSampleUptime, to: now)
         if elapsed >= 1 {
             bytesPerSecond = Double(max(0, bytes - lastBytes)) / elapsed
             lastSampleUptime = now
@@ -477,17 +477,17 @@ public final class InputRecorder: @unchecked Sendable {
         }
 
         // An empty ring means the source paused, which is not ffmpeg's fault.
-        if case .recording = watchdog.state, queued > 0, seconds(now - lastGrowthUptime) > settings.stallSeconds {
+        if case .recording = watchdog.state, queued > 0, HostTime.seconds(from: lastGrowthUptime, to: now) > settings.stallSeconds {
             send(.outputStalled)
             return
         }
 
-        if let since = healthySinceUptime, seconds(now - since) > 30 {
+        if let since = healthySinceUptime, HostTime.seconds(from: since, to: now) > 30 {
             watchdog.markHealthy()
             healthySinceUptime = nil
         }
 
-        if settings.fullSyncSeconds > 0, seconds(now - lastSyncUptime) >= settings.fullSyncSeconds {
+        if settings.fullSyncSeconds > 0, HostTime.seconds(from: lastSyncUptime, to: now) >= settings.fullSyncSeconds {
             lastSyncUptime = now
             let working = current.configuration.workingPath
             let index = current.configuration.indexPath
@@ -496,10 +496,6 @@ public final class InputRecorder: @unchecked Sendable {
                 Self.fullSync(index)
             }
         }
-    }
-
-    private func seconds(_ nanos: UInt64) -> Double {
-        Double(nanos) / 1_000_000_000
     }
 
     /// ffmpeg never forces data to the drive, so without this a power cut could lose more than the last fragment.
