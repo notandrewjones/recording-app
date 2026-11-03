@@ -35,6 +35,20 @@ P12_PATH="$(clean_path "$P12_PATH")"
 [[ -f "$P12_PATH" ]] || { echo "No such file: [$P12_PATH]" >&2; exit 1; }
 read -r -s -p "Export password for that .p12: " P12_PW; echo
 
+# The same import CI runs, into a throwaway keychain, so a wrong password fails here and not on the runner.
+CHECK_KEYCHAIN="$(mktemp -d)/check.keychain-db"
+security create-keychain -p check "$CHECK_KEYCHAIN"
+trap 'security delete-keychain "$CHECK_KEYCHAIN" 2>/dev/null || true' EXIT
+if ! security import "$P12_PATH" -P "$P12_PW" -f pkcs12 -k "$CHECK_KEYCHAIN" >/dev/null 2>&1; then
+  echo "That password doesn't open $P12_PATH. Nothing was uploaded." >&2
+  exit 1
+fi
+if ! security find-identity -v -p codesigning "$CHECK_KEYCHAIN" | grep -q "Developer ID Application"; then
+  echo "$P12_PATH has no Developer ID Application identity with its private key. Nothing was uploaded." >&2
+  exit 1
+fi
+echo "  .p12 opens and contains the Developer ID identity."
+
 read -r -p "Path to the App Store Connect API key (.p8): " P8_PATH
 P8_PATH="$(clean_path "$P8_PATH")"
 [[ -f "$P8_PATH" ]] || { echo "No such file: [$P8_PATH]" >&2; exit 1; }
