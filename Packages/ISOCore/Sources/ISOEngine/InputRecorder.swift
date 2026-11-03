@@ -35,8 +35,10 @@ public struct InputRecorderSettings: Sendable {
     public var signalTimeoutSeconds: Double
     public var fullSyncSeconds: Double
     public var allowSoftwareProRes: Bool
+    /// Where each segment's starting timecode comes from. `InputRecorder.setTimecodeSource` changes it later.
+    public var timecodeSource: TimecodeSource
 
-    public init(codec: Codec = .proResLT, audio: AudioFormat? = AudioFormat(channels: 16), ringSeconds: Double = 1, stallSeconds: Double = 5, signalTimeoutSeconds: Double = 1, fullSyncSeconds: Double = 2, allowSoftwareProRes: Bool = false) {
+    public init(codec: Codec = .proResLT, audio: AudioFormat? = AudioFormat(channels: 16), ringSeconds: Double = 1, stallSeconds: Double = 5, signalTimeoutSeconds: Double = 1, fullSyncSeconds: Double = 2, allowSoftwareProRes: Bool = false, timecodeSource: TimecodeSource = .source) {
         self.codec = codec
         self.audio = audio
         self.ringSeconds = ringSeconds
@@ -44,6 +46,7 @@ public struct InputRecorderSettings: Sendable {
         self.signalTimeoutSeconds = signalTimeoutSeconds
         self.fullSyncSeconds = fullSyncSeconds
         self.allowSoftwareProRes = allowSoftwareProRes
+        self.timecodeSource = timecodeSource
     }
 }
 
@@ -58,7 +61,8 @@ public struct InputRecorderStatus: Sendable {
     public var peakRingFill: Double
     /// Frames lost between segments, from a crash or restart. They are not in any file.
     public var gapFrames: Int
-    public var bytesPerSecond: Double
+    /// Bytes written across every segment so far, for the session's write rate.
+    public var bytesWritten: Int64
     public var ffmpegProcessIdentifier: Int32?
 }
 
@@ -85,6 +89,7 @@ public final class InputRecorder: @unchecked Sendable {
     private var lastIngestUptime: UInt64 = 0
     private var gapDetector: FrameGapDetector?
     private var rolloverPending = false
+    private var timecodeSource: TimecodeSource
 
     // Owned by `queue`.
     private var watchdog = RecorderWatchdog()
@@ -95,10 +100,9 @@ public final class InputRecorder: @unchecked Sendable {
     private var monitor: DispatchSourceTimer?
     private var lastBytes: Int64 = 0
     private var lastGrowthUptime: UInt64 = 0
-    private var lastSampleUptime: UInt64 = 0
     private var lastSyncUptime: UInt64 = 0
     private var healthySinceUptime: UInt64?
-    private var bytesPerSecond = 0.0
+    private var bytesWritten: Int64 = 0
     private var closedFrames = 0
     private var closedRepeats = 0
     private var restarts = 0
@@ -111,6 +115,7 @@ public final class InputRecorder: @unchecked Sendable {
         self.id = id
         self.label = label
         self.settings = settings
+        timecodeSource = settings.timecodeSource
         self.store = store
         self.finalizer = finalizer
         self.environment = environment
@@ -176,6 +181,15 @@ public final class InputRecorder: @unchecked Sendable {
 
     // MARK: Control
 
+    /// Applies from the next segment. A segment already open keeps the timecode it started with.
+    public func setTimecodeSource(_ source: TimecodeSource) {
+        lock.withLock { timecodeSource = source }
+    }
+
+    public var currentTimecodeSource: TimecodeSource {
+        lock.withLock { timecodeSource }
+    }
+
     public func startRecording() {
         queue.async { [self] in
             guard !isActive else { return }
@@ -234,7 +248,7 @@ public final class InputRecorder: @unchecked Sendable {
                 ringFill: lock.withLock { ring?.fillLevel ?? 0 },
                 peakRingFill: peakRingFill,
                 gapFrames: gapFrames,
-                bytesPerSecond: bytesPerSecond,
+                bytesWritten: bytesWritten,
                 ffmpegProcessIdentifier: current?.processIdentifier
             )
         }
@@ -308,7 +322,8 @@ public final class InputRecorder: @unchecked Sendable {
             audioSocketPath: "\(socketDirectory)/\(socketPrefix)a\(number).sock",
             environment: environment,
             streamTimeScale: 240_000,
-            allowSoftwareProRes: settings.allowSoftwareProRes
+            allowSoftwareProRes: settings.allowSoftwareProRes,
+            timecodeSource: currentTimecodeSource
         )
         let recorder = SegmentRecorder(configuration: configuration, ring: ring)
         recorder.onOpened = { [self] opening in
@@ -325,6 +340,8 @@ public final class InputRecorder: @unchecked Sendable {
             queue.async { [self] in segmentFinished(number: number, outcome: outcome, recorder: recorder) }
         }
         current = recorder
+        // The new file starts empty, so growth is counted from zero.
+        lastBytes = 0
         group.enter()
         recorder.start()
     }
@@ -368,7 +385,8 @@ public final class InputRecorder: @unchecked Sendable {
             audioChannels: settings.audio?.channels ?? 0,
             startTimecode: opening.startTimecode.string,
             timecodeIsEmbedded: opening.timecodeIsEmbedded,
-            startHostNanos: opening.startHostNanos
+            startHostNanos: opening.startHostNanos,
+            timecodeSource: opening.timecodeSource
         )
         let inputID = id
         store.update { manifest in
@@ -435,10 +453,10 @@ public final class InputRecorder: @unchecked Sendable {
     }
 
     private func startMonitor() {
-        lastSampleUptime = DispatchTime.now().uptimeNanoseconds
-        lastSyncUptime = lastSampleUptime
+        let now = DispatchTime.now().uptimeNanoseconds
+        lastSyncUptime = now
         lastBytes = 0
-        lock.withLock { lastIngestUptime = lastSampleUptime }
+        lock.withLock { lastIngestUptime = now }
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 0.25, repeating: 0.25)
         timer.setEventHandler { [self] in monitorTick() }
@@ -466,13 +484,9 @@ public final class InputRecorder: @unchecked Sendable {
         guard let current else { return }
 
         let bytes = current.bytesOnDisk
-        let elapsed = HostTime.seconds(from: lastSampleUptime, to: now)
-        if elapsed >= 1 {
-            bytesPerSecond = Double(max(0, bytes - lastBytes)) / elapsed
-            lastSampleUptime = now
-        }
-        if bytes != lastBytes {
-            if elapsed >= 1 { lastBytes = bytes }
+        if bytes > lastBytes {
+            bytesWritten += bytes - lastBytes
+            lastBytes = bytes
             lastGrowthUptime = now
         }
 

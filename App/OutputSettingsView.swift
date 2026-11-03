@@ -27,7 +27,7 @@ struct OutputSettingsView: View {
                 Picker("Applies to", selection: $selection) {
                     Text("All inputs").tag("default")
                     ForEach(model.tiles) { tile in
-                        Text(tile.source.input.displayName).tag(tile.id)
+                        Text(tile.name).tag(tile.id)
                     }
                 }
                 if let tile = selectedTile {

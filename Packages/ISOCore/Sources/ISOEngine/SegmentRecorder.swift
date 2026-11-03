@@ -17,11 +17,13 @@ final class SegmentRecorder: @unchecked Sendable {
         var environment: FFmpegEnvironment
         var streamTimeScale: Int64
         var allowSoftwareProRes: Bool
+        var timecodeSource: TimecodeSource
     }
 
     struct Opening {
         var startTimecode: Timecode
         var timecodeIsEmbedded: Bool
+        var timecodeSource: TimecodeSource
         var startHostNanos: UInt64
     }
 
@@ -52,6 +54,7 @@ final class SegmentRecorder: @unchecked Sendable {
     private var lastHostNanos: UInt64 = 0
 
     private var isAborted: Bool { lock.withLock { aborted } }
+    private var usesEmbeddedTimecode: Bool { configuration.timecodeSource == .source }
 
     init(configuration: Configuration, ring: FrameRing) {
         self.configuration = configuration
@@ -96,9 +99,12 @@ final class SegmentRecorder: @unchecked Sendable {
             return
         }
 
-        let embedded = first.metadata.timecode
-        let startTimecode = embedded ?? Timecode.timeOfDay(date: Date(), frameRate: ring.format.frameRate)
-        let opening = Opening(startTimecode: startTimecode, timecodeIsEmbedded: embedded != nil, startHostNanos: first.metadata.hostTimeNanos)
+        let embedded = usesEmbeddedTimecode ? first.metadata.timecode : nil
+        // Time of day is taken from when the first frame arrived, not from now: frames carried over in the
+        // ring after a restart can be most of a second old.
+        let arrived = HostTime.date(ofHostNanos: first.metadata.hostTimeNanos, now: Date(), nowHostNanos: DispatchTime.now().uptimeNanoseconds)
+        let startTimecode = embedded ?? Timecode.timeOfDay(date: arrived, frameRate: ring.format.frameRate)
+        let opening = Opening(startTimecode: startTimecode, timecodeIsEmbedded: embedded != nil, timecodeSource: configuration.timecodeSource, startHostNanos: first.metadata.hostTimeNanos)
 
         guard let launched = launchProcess(startTimecode: startTimecode) else {
             onFinished?(Outcome(framesWritten: 0, repeatedFrames: 0, exitCode: -1, neverStarted: false, drained: false))
@@ -191,8 +197,9 @@ final class SegmentRecorder: @unchecked Sendable {
         func writeFrame(_ pointer: UnsafeRawPointer, metadata: FrameRing.Metadata, repeated: Bool) -> Bool {
             guard socket.write(pointer, count: format.frameBytes, shouldContinue: keepGoing) == .finished else { return false }
             var flags: FrameIndexRecord.Flags = repeated ? .repeated : []
-            if !repeated, metadata.timecode != nil { flags.insert(.embeddedTimecode) }
-            let timecode = repeated ? nil : metadata.timecode
+            // The index records the file's timecode, so a generated time of day ignores the embedded one.
+            let timecode = repeated || !usesEmbeddedTimecode ? nil : metadata.timecode
+            if timecode != nil { flags.insert(.embeddedTimecode) }
             index.append(FrameIndexRecord(
                 frameNumber: ordinal,
                 hostTimeNanos: metadata.hostTimeNanos,

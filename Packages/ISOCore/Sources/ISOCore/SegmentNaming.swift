@@ -57,6 +57,16 @@ public struct SessionLayout: Hashable, Sendable {
         return cleaned.isEmpty ? "untitled" : cleaned
     }
 
+    /// `label`, or `label 2`, `label 3`… if its folder would collide with one in `taken`. Two inputs given the
+    /// same name would otherwise write into one folder. Compared without case, as the default APFS volume is.
+    public static func uniqueLabel(_ label: String, taken: [String]) -> String {
+        let used = Set(taken.map { sanitize($0).lowercased() })
+        guard used.contains(sanitize(label).lowercased()) else { return label }
+        var number = 2
+        while used.contains(sanitize("\(label) \(number)").lowercased()) { number += 1 }
+        return "\(label) \(number)"
+    }
+
     public static func defaultSessionName(date: Date, timeZone: TimeZone = .current) -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")

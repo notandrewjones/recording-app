@@ -11,7 +11,7 @@ Repeat it whenever any of those change.
 - [ ] All inputs show the right format and picture, with timecode where the source provides it.
 - [ ] Sources are real cameras or a generator with movement. Static bars understate the encoder load.
 - [ ] Each input's output settings are the ones you will use on the job.
-- [ ] No warnings show in the status bar or in Settings.
+- [ ] No warning banner shows under the toolbar, and nothing in Settings warns.
 - [ ] The drive has room for the whole test, plus one segment for finalizing. Check GB/hour in Settings.
 - [ ] Energy settings will not sleep the Mac. The MacBook is on mains power, with the lid open. Run `pmset -g batt` to confirm, because a run on battery says nothing about the recorder once the charge gets low.
 - [ ] Close other apps, or leave open what will really be open on the job.

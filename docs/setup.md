@@ -28,28 +28,65 @@ build/Build/Products/Debug/ISORecorder.app/Contents/MacOS/ISORecorder
 Pass `-synthetic 4` to start with four generated inputs. Inputs > Add Synthetic Input (⇧⌘N) adds more.
 Add `-syntheticGrain YES` for realistic encoder load, and `-autoRecordSeconds 60` to record unattended.
 
-Recordings go to `~/Movies/ISO Recorder`. Change this with
-`defaults write com.notandrewjones.ISORecorder recordingRoot /path`.
+Recordings go to `~/Movies/ISO Recorder`. Choose another folder under ISO Recorder > Settings (⌘,) > General,
+or click the free-space text in the status bar. If a chosen folder is missing, for example because its drive
+is unplugged, the app refuses to record rather than recreate the path on another disk.
 
-Output settings are under ISO Recorder > Settings (⌘,), or the codec name in the status bar.
+Rename an input by double-clicking its name or right-clicking its tile, or under Settings > General.
+Arm or disarm an input with the record button in its tile header, or ⌘1–⌘9 by position. Names are kept by input ID, survive
+relaunches, and are used for the recording's folder and file names. Two inputs with the same name get `_2`
+appended to the second one's files.
+
+Output settings are under Settings > Output, or the codec name in the status bar.
 
 ## Control API
 
-The app listens on `127.0.0.1:9455`, for Bitfocus Companion's generic HTTP module, Stream Deck actions or
-curl. Change the port with `defaults write com.notandrewjones.ISORecorder controlPort -int 9000`, and use 0
-to turn it off. Replies are JSON.
+The app serves a small JSON API on port 9455, for Bitfocus Companion, Stream Deck actions or curl. Its
+settings are under Settings > General > Remote control. The port can also be set with
+`defaults write com.notandrewjones.ISORecorder controlPort -int 9000`, and 0 turns the API off.
 
 | Request | Effect |
 |---|---|
-| `GET /api/v1/status` | Recording state, free space and each input |
+| `GET /api/v1/status` | Recording state, free space, `recordingSeconds` while recording, and each input (`label` is its name, `device` the hardware name, `index` its position) |
 | `POST /api/v1/record/start` | Record All |
 | `POST /api/v1/record/stop` | Stop All |
+| `POST /api/v1/record/toggle` | Record All, or Stop All when recording |
 | `POST /api/v1/marker` | Adds a marker. Optional body: `{"label": "Goal"}` |
-| `POST /api/v1/inputs/<id>/arm` | Arms an input |
-| `POST /api/v1/inputs/<id>/disarm` | Disarms an input |
+| `POST /api/v1/inputs/<id>/arm` | Arms an input. While recording, it joins the session in a new segment |
+| `POST /api/v1/inputs/<id>/disarm` | Disarms an input. While recording, it stops just that input |
+| `POST /api/v1/inputs/<id>/toggle` | Arms or disarms an input |
 
-It only binds to loopback, so a Companion on another machine needs it opened up first. Requests carrying a
-browser `Origin` header or a non-local `Host` are refused, so a web page cannot control a recording.
+Every command replies with the full status, the same as `GET /status`.
+
+By default only this Mac can connect. **Allow control from other computers** also listens on the network,
+and other computers must then send the access token shown in Settings:
+
+```sh
+curl -H "Authorization: Bearer <token>" -X POST http://<mac-address>:9455/api/v1/record/toggle
+```
+
+The token travels as plain HTTP, so only turn this on for a network you trust. Requests from this Mac need
+no token. Requests carrying a browser `Origin` header, or a non-local `Host` from this Mac, are refused, so a
+web page cannot control a recording.
+
+## Bitfocus Companion
+
+`companion-module/` is a Companion connection module, for Companion 4.3 or later. It records, arms and
+disarms inputs, and lights buttons with tally, saving state and the recording time.
+[companion-module/companion/HELP.md](../companion-module/companion/HELP.md) covers what it offers.
+
+To build it, run this with Node 22 or later and corepack:
+
+```sh
+cd companion-module
+corepack yarn install
+corepack yarn package    # writes iso-recorder-<version>.tgz
+```
+
+In Companion's **Modules** page, import the `.tgz`. Then add an **ISO Recorder** connection and enter the
+address, port and token from ISO Recorder's Settings. For development, set **Developer Modules Path** in
+Companion's launcher settings to the folder that contains `companion-module`, and run `corepack yarn dev`,
+which rebuilds on every change.
 
 ## NLE exports
 

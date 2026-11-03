@@ -15,6 +15,7 @@ public final class RecordingSession: @unchecked Sendable {
     private let healthLock = UnfairLock()
     private var storageLevel = StoragePolicy.Level.ok
     private var writeBytesPerSecond = 0.0
+    private var writeRate = WriteRateMeter()
     private var healthLog: HealthLog?
     private var healthTicks = 0
     private let healthIntervalTicks: Int
@@ -48,7 +49,7 @@ public final class RecordingSession: @unchecked Sendable {
     public func addInput(id: String, label: String, settings: InputRecorderSettings = InputRecorderSettings()) -> InputRecorder {
         let recorder = InputRecorder(
             id: id,
-            label: label,
+            label: SessionLayout.uniqueLabel(label, taken: recorders.map(\.label)),
             settings: settings,
             store: store,
             finalizer: finalizer,
@@ -87,7 +88,9 @@ public final class RecordingSession: @unchecked Sendable {
 
     /// Stops with room to spare. A drive that fills completely fails every input at once, mid-fragment.
     private func checkStorage() {
-        let rate = recorders.map { $0.status().bytesPerSecond }.reduce(0, +)
+        let written = recorders.map { $0.status().bytesWritten }.reduce(0, +)
+        writeRate.add(seconds: Double(DispatchTime.now().uptimeNanoseconds) / 1e9, bytes: written)
+        let rate = writeRate.bytesPerSecond
         let free = SystemMetrics.freeBytes(at: layout.sessionDirectory)
         let level = storagePolicy.evaluate(freeBytes: free, writeBytesPerSecond: rate)
         healthLock.withLock {

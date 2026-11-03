@@ -207,6 +207,14 @@ import Testing
         #expect(SessionLayout.sanitize("///") == "untitled")
     }
 
+    @Test func uniqueLabelAvoidsFolderCollisions() {
+        #expect(SessionLayout.uniqueLabel("Wide", taken: []) == "Wide")
+        #expect(SessionLayout.uniqueLabel("Wide", taken: ["Tight"]) == "Wide")
+        #expect(SessionLayout.uniqueLabel("Wide", taken: ["wide"]) == "Wide 2")
+        #expect(SessionLayout.uniqueLabel("Cam/1", taken: ["Cam 1"]) == "Cam/1 2")
+        #expect(SessionLayout.uniqueLabel("Wide", taken: ["Wide", "Wide 2"]) == "Wide 3")
+    }
+
     @Test func defaultName() {
         let name = SessionLayout.defaultSessionName(date: Date(timeIntervalSince1970: 0), timeZone: TimeZone(identifier: "UTC")!)
         #expect(name == "1970-01-01_000000")
@@ -338,6 +346,44 @@ import Testing
         #expect(dog.state == .idle)
     }
 
+    @Test func recordingAgainAfterStopOpensNewSegment() {
+        var dog = recording()
+        _ = dog.handle(.stopRequested)
+        #expect(dog.handle(.recordRequested) == [.startProcess(segment: 2)])
+    }
+
+    @Test func stopWhileStartingStillAdvancesSegment() {
+        var dog = RecorderWatchdog()
+        _ = dog.handle(.recordRequested)
+        _ = dog.handle(.stopRequested)
+        #expect(dog.handle(.recordRequested) == [.startProcess(segment: 2)])
+    }
+
+    @Test func stopBeforeFirstFrameKeepsUnusedSegment() {
+        var dog = RecorderWatchdog()
+        _ = dog.handle(.recordRequested)
+        _ = dog.handle(.noSignalYet)
+        _ = dog.handle(.stopRequested)
+        #expect(dog.handle(.recordRequested) == [.startProcess(segment: 1)])
+    }
+
+    @Test func stopDuringSignalWaitKeepsNextSegment() {
+        var dog = recording()
+        _ = dog.handle(.signalLost)
+        _ = dog.handle(.stopRequested)
+        #expect(dog.handle(.recordRequested) == [.startProcess(segment: 2)])
+    }
+
+    @Test func recordingAgainAfterGivingUpOpensNewSegment() {
+        var dog = RecorderWatchdog(maxAttempts: 1)
+        _ = dog.handle(.recordRequested)
+        _ = dog.handle(.processExited(segment: 1, code: 1))
+        _ = dog.handle(.backoffElapsed)
+        _ = dog.handle(.processExited(segment: 2, code: 1))
+        if case .failed = dog.state {} else { Issue.record("expected failed, got \(dog.state)") }
+        #expect(dog.handle(.recordRequested) == [.startProcess(segment: 3)])
+    }
+
     @Test func staleExitAfterStopIsIgnored() {
         var dog = recording()
         _ = dog.handle(.stopRequested)
@@ -449,6 +495,45 @@ import Testing
         #expect(tc.string == "01:00:00:00")
     }
 
+    private var utc: Calendar {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        return calendar
+    }
+
+    private let noon = Date(timeIntervalSince1970: 12 * 3600)
+
+    /// 23.976 is labelled at 24, so counting at the real rate would read about 43 s slow at noon.
+    @Test func nonDropNTSCRateCountsAtTheNominalRate() {
+        let tc = Timecode.timeOfDay(date: noon, frameRate: Rational(24000, 1001), calendar: utc)
+        #expect(tc.string == "12:00:00:00")
+        #expect(!tc.isDropFrame)
+    }
+
+    @Test(arguments: [Rational(25, 1), Rational(50, 1), Rational(30, 1)])
+    func integerRatesAreExact(rate: Rational) {
+        let date = noon.addingTimeInterval(0.5)
+        let tc = Timecode.timeOfDay(date: date, frameRate: rate, calendar: utc)
+        #expect(tc.string == "12:00:00:\(String(format: "%02d", Int(rate.doubleValue) / 2))")
+    }
+
+    /// Drop-frame numbering keeps pace with the clock to within a frame or two over a day.
+    @Test(arguments: [Rational(30000, 1001), Rational(60000, 1001)])
+    func dropFrameTracksTheClock(rate: Rational) {
+        let tc = Timecode.timeOfDay(date: noon, frameRate: rate, calendar: utc)
+        #expect(tc.isDropFrame)
+        let exact = Timecode(hours: 12, minutes: 0, seconds: 0, frames: 0, nominalFPS: tc.nominalFPS, isDropFrame: true)
+        #expect(abs(tc.frameCount - exact.frameCount) <= 2, "\(tc.string)")
+    }
+
+    @Test func hostTimeMapsToTheWallClock() {
+        let now = Date(timeIntervalSince1970: 1000)
+        let frame = HostTime.date(ofHostNanos: 4_500_000_000, now: now, nowHostNanos: 5_000_000_000)
+        #expect(abs(frame.timeIntervalSince1970 - 999.5) < 1e-9)
+        // A frame stamped after the clock was sampled is at most a moment old.
+        #expect(HostTime.date(ofHostNanos: 6_000_000_000, now: now, nowHostNanos: 5_000_000_000) == now)
+    }
+
     @Test func advanceKeepsMode() {
         let tc = Timecode(frameCount: 10, nominalFPS: 60, isDropFrame: true).advanced(by: 5)
         #expect(tc.frameCount == 15)
@@ -467,6 +552,28 @@ import Testing
         manifest.markers.append(.init(hostNanos: 3, label: "Goal"))
         let data = try SessionManifest.encoder().encode(manifest)
         #expect(try SessionManifest.decoder().decode(SessionManifest.self, from: data) == manifest)
+    }
+
+    @Test func timecodeSourceRoundTrips() throws {
+        var manifest = SessionManifest(name: "Game", createdAt: Date(timeIntervalSince1970: 1_000_000), createdAtHostNanos: 7)
+        var input = SessionManifest.InputRecord(id: "a", label: "Cam 1")
+        input.segments.append(SessionManifest.SegmentRecord(number: 1, workingFile: "w", finalFile: "f", indexFile: "i", logFile: "l", format: .hd1080p5994, codec: .proResLT, audioChannels: 2, startTimecode: "12:00:00;00", timecodeIsEmbedded: false, startHostNanos: 9, timecodeSource: .timeOfDay))
+        manifest.inputs.append(input)
+        let data = try SessionManifest.encoder().encode(manifest)
+        let decoded = try SessionManifest.decoder().decode(SessionManifest.self, from: data)
+        #expect(decoded.inputs[0].segments[0].timecodeSource == .timeOfDay)
+    }
+
+    /// Manifests written before the setting existed must still load, or recovery would skip them.
+    @Test func segmentsWithoutATimecodeSourceStillDecode() throws {
+        var manifest = SessionManifest(name: "Game", createdAt: Date(timeIntervalSince1970: 1_000_000), createdAtHostNanos: 7)
+        var input = SessionManifest.InputRecord(id: "a", label: "Cam 1")
+        input.segments.append(SessionManifest.SegmentRecord(number: 1, workingFile: "w", finalFile: "f", indexFile: "i", logFile: "l", format: .hd1080p5994, codec: .proResLT, audioChannels: 2, startTimecode: "01:00:00;00", timecodeIsEmbedded: true, startHostNanos: 9))
+        manifest.inputs.append(input)
+        let data = try SessionManifest.encoder().encode(manifest)
+        #expect(!String(decoding: data, as: UTF8.self).contains("timecodeSource"))
+        let decoded = try SessionManifest.decoder().decode(SessionManifest.self, from: data)
+        #expect(decoded.inputs[0].segments[0].timecodeSource == nil)
     }
 
     @Test func pathsAreRelativeToTheSession() {
@@ -491,6 +598,43 @@ import Testing
     @Test func plentyOfRoomIsFine() {
         #expect(policy.evaluate(freeBytes: 10_000_000, writeBytesPerSecond: 10) == .ok)
         #expect(policy.evaluate(freeBytes: 2000, writeBytesPerSecond: 0) == .ok)
+    }
+}
+
+@Suite struct WriteRateMeterTests {
+    @Test func reportsNothingUntilTheMinimumSpan() {
+        var meter = WriteRateMeter(windowSeconds: 30, minimumSeconds: 5)
+        meter.add(seconds: 0, bytes: 0)
+        meter.add(seconds: 1, bytes: 100)
+        meter.add(seconds: 4, bytes: 400)
+        #expect(meter.bytesPerSecond == 0)
+        meter.add(seconds: 6, bytes: 600)
+        #expect(meter.bytesPerSecond == 100)
+    }
+
+    @Test func burstyWritesAverageOut() {
+        var meter = WriteRateMeter(windowSeconds: 30, minimumSeconds: 5)
+        // A 100-byte fragment lands every other half-second tick: 100 bytes/s on average.
+        var bytes: Int64 = 0
+        for tick in 1...120 {
+            if tick % 2 == 0 { bytes += 100 }
+            meter.add(seconds: Double(tick) * 0.5, bytes: bytes)
+        }
+        #expect(abs(meter.bytesPerSecond - 100) < 4)
+    }
+
+    @Test func followsAChangeOnceTheWindowPasses() {
+        var meter = WriteRateMeter(windowSeconds: 10, minimumSeconds: 5)
+        var bytes: Int64 = 0
+        for second in 1...20 {
+            bytes += 100
+            meter.add(seconds: Double(second), bytes: bytes)
+        }
+        for second in 21...40 {
+            bytes += 300
+            meter.add(seconds: Double(second), bytes: bytes)
+        }
+        #expect(meter.bytesPerSecond == 300)
     }
 }
 
@@ -790,6 +934,41 @@ import Testing
         for host in ["localhost:9455", "127.0.0.1", "[::1]:9455"] {
             #expect(try route("GET", "/api/v1/status", headers: "Host: \(host)\r\n") == .command(.status))
         }
+    }
+
+    @Test func routesToggles() throws {
+        #expect(try route("POST", "/api/v1/record/toggle") == .command(.toggleRecording))
+        #expect(try route("POST", "/api/v1/inputs/cam%201/toggle") == .command(.toggleArmed(inputID: "cam 1")))
+        #expect(status(try route("GET", "/api/v1/record/toggle")) == 405)
+    }
+
+    func remote(_ method: String, _ path: String, headers: String, token: String? = "s3cret") throws -> ControlRouter.Result {
+        ControlRouter.route(try #require(request(method, path, headers: headers)), fromLoopback: false, token: token)
+    }
+
+    @Test func otherComputersNeedTheToken() throws {
+        let host = "Host: 192.168.1.20:9455\r\n"
+        #expect(status(try remote("POST", "/api/v1/record/toggle", headers: host)) == 401)
+        #expect(status(try remote("POST", "/api/v1/record/toggle", headers: host + "Authorization: Bearer wrong\r\n")) == 401)
+        #expect(status(try remote("POST", "/api/v1/record/toggle", headers: host + "Authorization: Bearer s3cre\r\n")) == 401)
+        #expect(status(try remote("POST", "/api/v1/record/toggle", headers: host + "Authorization: s3cret\r\n")) == 401)
+        #expect(try remote("POST", "/api/v1/record/toggle", headers: host + "Authorization: Bearer s3cret\r\n") == .command(.toggleRecording))
+        #expect(try remote("GET", "/api/v1/status", headers: host + "authorization: bearer s3cret\r\n") == .command(.status))
+    }
+
+    @Test func aForgedLocalHostDoesNotSkipTheToken() throws {
+        #expect(status(try remote("POST", "/api/v1/record/stop", headers: "Host: 127.0.0.1:9455\r\n")) == 401)
+    }
+
+    @Test func otherComputersAreRefusedWithoutAToken() throws {
+        let headers = "Host: 192.168.1.20:9455\r\nAuthorization: Bearer \r\n"
+        #expect(status(try remote("POST", "/api/v1/record/stop", headers: headers, token: nil)) == 401)
+        #expect(status(try remote("POST", "/api/v1/record/stop", headers: headers, token: "")) == 401)
+    }
+
+    @Test func browsersAreRefusedEvenWithTheToken() throws {
+        let headers = "Host: 192.168.1.20:9455\r\nAuthorization: Bearer s3cret\r\nOrigin: https://evil.example\r\n"
+        #expect(status(try remote("POST", "/api/v1/record/stop", headers: headers)) == 403)
     }
 
     @Test func wrongMethodAndUnknownPaths() throws {

@@ -123,6 +123,69 @@ import Testing
         #expect(records[1].timecodeFrames == records[0].timecodeFrames + 1)
     }
 
+    @Test func timeOfDayModeIgnoresEmbeddedTimecode() throws {
+        let embedded = Timecode(hours: 1, minutes: 0, seconds: 0, frames: 0, nominalFPS: 60, isDropFrame: true)
+        let settings = InputRecorderSettings(fullSyncSeconds: 0, timecodeSource: .timeOfDay)
+        let harness = try Harness(environment: environment, settings: settings, source: SyntheticSource(timecodeStart: embedded))
+        let before = Timecode.timeOfDay(date: Date(), frameRate: Rational(60000, 1001))
+        harness.record(frames: 90)
+        let segment = try #require(harness.segments.first)
+
+        #expect(!segment.timecodeIsEmbedded)
+        #expect(segment.timecodeSource == .timeOfDay)
+        #expect(segment.startTimecode != embedded.string)
+        let start = try #require(Timecode(string: segment.startTimecode, frameRate: Rational(60000, 1001)))
+        // Started after `before` was read, and within a couple of seconds of it (unless midnight passed).
+        let elapsed = start.frameCount - before.frameCount
+        #expect((0...120).contains(elapsed) || before.frameCount > start.frameCount + 1_000_000, "\(before.string) then \(segment.startTimecode)")
+
+        #expect(try harness.info(segment, environment: environment).timecode == segment.startTimecode)
+        let records = harness.indexRecords(segment)
+        #expect(records.allSatisfy { !$0.flags.contains(.embeddedTimecode) })
+        #expect(records.first?.timecodeFrames == UInt32(start.frameCount))
+        #expect(zip(records, records.dropFirst()).allSatisfy { $1.timecodeFrames == $0.timecodeFrames + 1 })
+    }
+
+    @Test func sourceModeIsTheDefaultAndKeepsEmbeddedTimecode() throws {
+        let embedded = Timecode(hours: 1, minutes: 0, seconds: 0, frames: 0, nominalFPS: 60, isDropFrame: true)
+        let harness = try Harness(environment: environment, source: SyntheticSource(timecodeStart: embedded))
+        harness.record(frames: 60)
+        let segment = try #require(harness.segments.first)
+        #expect(segment.timecodeIsEmbedded)
+        #expect(segment.timecodeSource == .source)
+        // Recording starts a moment after the source does, so the first frame is a little past its start.
+        let start = try #require(Timecode(string: segment.startTimecode, frameRate: Rational(60000, 1001)))
+        #expect((0...60).contains(start.frameCount - embedded.frameCount), "\(segment.startTimecode)")
+    }
+
+    /// The app reuses a recorder when an input is punched back in, so a change made while it was out
+    /// must reach its next segment.
+    @Test func timecodeSourceChangeAppliesOnPunchIn() throws {
+        let embedded = Timecode(hours: 1, minutes: 0, seconds: 0, frames: 0, nominalFPS: 60, isDropFrame: true)
+        let source = SyntheticSource(timecodeStart: embedded)
+        let harness = try Harness(environment: environment, source: source)
+        let recorder = harness.recorder
+
+        source.start()
+        Thread.sleep(forTimeInterval: 0.1)
+        recorder.startRecording()
+        Thread.sleep(forTimeInterval: 1)
+        recorder.stopRecording()
+        Thread.sleep(forTimeInterval: 0.5)
+        recorder.setTimecodeSource(.timeOfDay)
+        recorder.startRecording()
+        Thread.sleep(forTimeInterval: 1)
+        harness.finish()
+
+        let segments = harness.segments
+        #expect(segments.map(\.number) == [1, 2])
+        #expect(segments.map(\.timecodeSource) == [.source, .timeOfDay])
+        #expect(segments.map(\.timecodeIsEmbedded) == [true, false])
+        for segment in segments {
+            #expect(try harness.info(segment, environment: environment).timecode == segment.startTimecode)
+        }
+    }
+
     @Test func missingFramesAreFilledSoFramesStayExact() throws {
         let source = SyntheticSource(faults: [60: .dropFrames(7)])
         let harness = try Harness(environment: environment, source: source)
@@ -178,6 +241,49 @@ import Testing
         for segment in segments {
             #expect(try harness.info(segment, environment: environment).videoFrames == harness.indexRecords(segment).count)
         }
+    }
+
+    /// Mirrors the app's punch out and in: frames stop reaching the recorder, it stops, then both resume.
+    @Test func punchingOutAndBackInRecordsANewSegmentAtItsRealTime() throws {
+        let source = SyntheticSource()
+        let harness = try Harness(environment: environment, source: source)
+        let attached = PunchGate()
+        let recorder = harness.recorder
+        source.onFrame = { frame in if attached.isOpen { recorder.ingest(frame) } }
+
+        source.start()
+        Thread.sleep(forTimeInterval: 0.1)
+        recorder.startRecording()
+        Thread.sleep(forTimeInterval: 1.5)
+        attached.isOpen = false
+        recorder.stopRecording()
+        Thread.sleep(forTimeInterval: 1)
+        attached.isOpen = true
+        recorder.startRecording()
+        Thread.sleep(forTimeInterval: 1.5)
+        harness.finish()
+
+        let segments = harness.segments
+        #expect(segments.map(\.number) == [1, 2])
+        #expect(Set(segments.map(\.finalFile)).count == 2)
+        for segment in segments {
+            #expect(segment.state == .finalized)
+            #expect(segment.endReason == .stopped)
+            #expect(segment.lostFrames == 0)
+            #expect(FileManager.default.fileExists(atPath: harness.session.layout.absolutePath(segment.finalFile)))
+            #expect(try harness.info(segment, environment: environment).videoFrames == harness.indexRecords(segment).count)
+        }
+        #expect(!harness.session.store.snapshot.inputs[0].events.contains { $0.kind == "signal_lost" })
+
+        let report = try SessionAnalysis.report(directory: harness.session.layout.sessionDirectory)
+        #expect(report.passed, "\(report.text)")
+
+        // The second clip sits after the punched-out second, not straight after the first clip.
+        let plan = try #require(MulticamPlan(manifest: harness.session.store.snapshot, sessionDirectory: harness.session.layout.sessionDirectory))
+        let clips = try #require(plan.angles.first).clips
+        #expect(clips.count == 2)
+        let gap = clips[1].offsetFrames - (clips[0].offsetFrames + clips[0].timelineFrames)
+        #expect(gap > 30, "gap of \(gap) frames")
     }
 
     @Test func frameDeliveryStoppingCountsAsSignalLoss() throws {
@@ -525,6 +631,30 @@ import Testing
 
         #expect(received.values == [.startRecording])
     }
+
+    @Test func lanModeNeedsTheTokenFromOtherAddresses() async throws {
+        let address = try #require(NetworkAddresses.ipv4().first, "needs a network interface")
+        let server = ControlServer { _ in ControlResponse(status: 200, body: Data("{}".utf8)) }
+        let port: UInt16 = try await withCheckedThrowingContinuation { continuation in
+            do {
+                try server.start(port: 0, lanToken: "s3cret") { continuation.resume(with: $0) }
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
+        defer { server.stop() }
+
+        func status(_ host: String, token: String?) async throws -> Int? {
+            var request = URLRequest(url: URL(string: "http://\(host):\(port)/api/v1/status")!)
+            if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+            return (try await URLSession.shared.data(for: request).1 as? HTTPURLResponse)?.statusCode
+        }
+        // Arrives from this Mac's LAN address, so it counts as another computer.
+        #expect(try await status(address, token: nil) == 401)
+        #expect(try await status(address, token: "wrong") == 401)
+        #expect(try await status(address, token: "s3cret") == 200)
+        #expect(try await status("127.0.0.1", token: nil) == 200)
+    }
 }
 
 @Suite(.serialized) struct DiagnosticsTests {
@@ -571,5 +701,16 @@ final class UnfairLockedArray: @unchecked Sendable {
 
     var values: [ControlCommand] {
         lock.withLock { stored }
+    }
+}
+
+/// Stands in for the app's `RecorderSink`, which stops passing frames to a punched-out recorder.
+final class PunchGate: @unchecked Sendable {
+    private let lock = UnfairLock()
+    private var open = true
+
+    var isOpen: Bool {
+        get { lock.withLock { open } }
+        set { lock.withLock { open = newValue } }
     }
 }

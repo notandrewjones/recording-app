@@ -1,4 +1,10 @@
 // DECKLINK_SDK_PATH points at the folder containing Mac/include. The headers are vendored, so this only
 // needs overriding, in Config/Local.xcconfig (git-ignored), to build against another SDK. See docs/setup.md.
 DECKLINK_SDK_PATH = $(SRCROOT)/Vendor/DeckLinkSDK
+
+// Sparkle updates. The public key comes from scripts/sparkle-setup-keys.sh; empty disables updates.
+// "//" would start a comment, so the URL's slashes go through a variable.
+SLASH = /
+SPARKLE_FEED_URL = https:$(SLASH)$(SLASH)notandrewjones.github.io/recording-app/appcast.xml
+SPARKLE_PUBLIC_KEY = P+PtHEGdSwzj3UOjaOoVcP09UVz/yMwDwZQm+9igEB4=
 #include? "Local.xcconfig"

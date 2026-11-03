@@ -1,0 +1,28 @@
+{
+	"$schema": "../node_modules/@companion-module/base/assets/manifest.schema.json",
+	"type": "connection",
+	"id": "iso-recorder",
+	"name": "ISO Recorder",
+	"shortname": "isorec",
+	"description": "Start and stop recording, and arm or disarm inputs on ISO Recorder for macOS, with tally feedback.",
+	"version": "0.0.0",
+	"license": "MIT",
+	"repository": "git+https://github.com/notandrewjones/recording-app.git",
+	"bugs": "https://github.com/notandrewjones/recording-app/issues",
+	"maintainers": [
+		{
+			"name": "notandrewjones",
+			"github": "notandrewjones"
+		}
+	],
+	"runtime": {
+		"type": "node22",
+		"api": "nodejs-ipc",
+		"apiVersion": "0.0.0",
+		"entrypoint": "../dist/main.js"
+	},
+	"legacyIds": [],
+	"manufacturer": "ISO Recorder",
+	"products": ["ISO Recorder"],
+	"keywords": ["recording", "iso", "decklink", "multicam"]
+}

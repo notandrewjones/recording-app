@@ -50,3 +50,16 @@ The app runs on Apple Silicon only, so releases are `arm64`.
 ## App icon
 
 `swift tools/make-app-icon.swift` redraws every size in `App/Assets.xcassets/AppIcon.appiconset`.
+
+## In-app updates (Sparkle)
+
+The app checks `https://notandrewjones.github.io/recording-app/appcast.xml` daily and on **ISO Recorder > Check for Updates…**. Updates are verified with an EdDSA key, not an API key:
+
+- **Public key**: `SPARKLE_PUBLIC_KEY` in `Config/App.xcconfig`, copied into Info.plist as `SUPublicEDKey`. Empty disables updates.
+- **Private key**: in your login Keychain and the `SPARKLE_ED_PRIVATE_KEY` GitHub secret. Back it up (`generate_keys -x`). If it is lost, installed copies cannot accept updates signed with a new key.
+
+One-time setup: the repo must be public (the app downloads the feed and .dmg without credentials). Run `scripts/sparkle-setup-keys.sh`, commit `Config/App.xcconfig`, then in Settings > Pages deploy from the `gh-pages` branch (it exists after the first tagged release).
+
+On each `v*` tag, after the GitHub Release is published, CI runs `scripts/make_appcast.sh`, which signs the .dmg and adds it to `appcast.xml` on `gh-pages`. Enclosures point at the release asset. Prereleases are included, since all v0.x tags are prereleases.
+
+If an operator accepts an update during a recording, the relaunch waits until recording stops and segments are finalized.

@@ -88,6 +88,19 @@ tracks. The file is readable while growing, about 0.5 s behind live. Power loss 
 A stream copy changed `01:02:03;04` to `01:01:59:20`. The frame count survives but the drop-frame flag
 does not. Restating `-timecode` preserves it.
 
+## Time-of-day timecode is per input and taken from the frame's arrival time
+
+Each input either keeps its source's embedded timecode (time of day if there is none) or always generates
+time of day, for cameras whose own timecode is free-running or wrong. The choice is saved per input ID and
+locked while that input records, because a file keeps the timecode it started with. A recorder reused on
+punch-in picks up a change made while the input was out.
+
+The start is the first frame's host time mapped to the wall clock, not the moment the writer reads the
+clock, which after a restart can be most of a second later. Drop-frame rates count at the real rate, which
+tracks the clock. Non-drop rates count at the nominal rate: 23.976 counted at its real rate read about 43 s
+slow at noon. A long 23.976 recording still falls behind the clock by 3.6 s an hour, as any 23.976 timecode
+does, but each segment starts at the right time.
+
 ## Field order and colour are set with `setparams`
 
 `prores_videotoolbox` ignores `-field_order` and `-colorspace`. Set on frames with `setparams`, field
@@ -186,11 +199,41 @@ scaled to it. Segments that could not be finalized point at their working file.
 FCPXML can express a real multicam, and output is validated against Apple's own 1.11 DTD. FCP7 XML has no
 dependable multicam form, so Premiere gets aligned tracks. A CMX EDL has one video track, hence one per input.
 
-## The control API is local HTTP
+## The control API is local HTTP, and opens to the network only with a token
 
 Companion's generic HTTP module can drive it with no custom module. A local server is reachable from any web
-page, so it binds to loopback and refuses `Origin` headers and non-local `Host` values. WebSocket and OSC can
-be added later without changing the commands.
+page, so it refuses `Origin` headers and, from this Mac, non-local `Host` values. WebSocket and OSC can be
+added later without changing the commands.
+
+Companion usually runs on another computer, so the API can also listen on the network. That is opt-in, and
+other computers must then send a bearer token. Whether a request comes from this Mac is decided by the
+connection's address, never by `Host`, which any client other than a browser can set to `127.0.0.1`. The
+token protects against other machines and pages, not against software already on this Mac, which could use
+the API anyway, so it is kept in UserDefaults rather than the Keychain. It is sent as plain HTTP, which is
+acceptable on a production network and not on an untrusted one.
+
+The dedicated module in `companion-module/` polls `GET /status` four times a second rather than holding a
+push connection open. It survives app restarts with no reconnect logic, and on a local network it costs
+nothing. Every command replies with the full status, so buttons update without waiting for the next poll.
+
+The module is built against `@companion-module/base` 2.0, the newest version that Companion 4.3 still
+loads. Companion's tooling requires module source to be MIT licensed, so `companion-module/` is MIT whatever
+the app's licence is.
+
+## Arming during a recording punches an input in or out
+
+Disarming a recording input stops just that input, and arming joins the running session. This is the same
+from the multiview and from the API. Each tile has an arm button, ⌘1–⌘9 arm by position, and clicks on the
+picture do nothing, so a stray click can't drop an angle. The multiview asks before stopping a recording
+input. The API doesn't ask.
+
+An input that is punched back in starts a new segment, and exports place it at its real time on the
+timeline. A clean stop is not a failure, so the session report doesn't count the gap. An input that is
+punched out, unplugged and plugged back in stays out until it is armed again.
+
+This exposed a bug that could have overwritten footage. `RecorderWatchdog` didn't advance the segment number
+on a stop, so recording an input again in the same session reopened its last segment's files. Recording again
+after giving up on a failing recorder did the same. Both now move on to a new number.
 
 ## Soak result so far: 77 clean minutes, then a crash that is now fixed
 
@@ -220,3 +263,7 @@ Hardened runtime refuses a framework signed by another team, and Desktop Video i
 `DeckLinkAPI.framework` under Blackmagic's. `build_release.sh` fails if the entitlement is missing, because
 the app would still launch but find no cards. A notarized 0.4.0 build loaded the framework and recorded two
 synthetic inputs through Homebrew ffmpeg. It has not been tried with a capture card.
+
+## Sparkle updates served from GitHub Pages
+
+Sparkle 2 with an appcast on the `gh-pages` branch, enclosures pointing at GitHub Release assets. The repo is public so no credential ships in the app. `releases/latest` was rejected because v0.x releases are prereleases, which it skips. Relaunch is postponed while segments are open so an update never cuts a recording.

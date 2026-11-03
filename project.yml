@@ -10,6 +10,9 @@ configFiles:
 packages:
   ISOCore:
     path: Packages/ISOCore
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: 2.6.0
 targets:
   ISORecorder:
     type: application
@@ -22,12 +25,14 @@ targets:
         product: ISOCore
       - package: ISOCore
         product: ISOEngine
+      - package: Sparkle
     settings:
       base:
         PRODUCT_NAME: ISORecorder
         SWIFT_VERSION: "5.0"
         SWIFT_OBJC_BRIDGING_HEADER: App/ISORecorder-Bridging-Header.h
         GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_FILE: App/Info.plist
         INFOPLIST_KEY_NSHumanReadableCopyright: ""
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.video
         MARKETING_VERSION: "0.1.0"

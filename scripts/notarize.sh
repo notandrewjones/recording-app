@@ -25,6 +25,9 @@ DMG="$BUILD_DIR/ISORecorder.dmg"
 ZIP="$BUILD_DIR/ISORecorder-notarize.zip"
 [[ -d "$APP" ]] || { echo "Missing $APP. Run scripts/build_release.sh first." >&2; exit 1; }
 
+# Sparkle's nested helpers (Autoupdate, Updater.app, XPC services) must carry the same Developer ID signature.
+codesign --verify --deep --strict --verbose=2 "$APP"
+
 echo "==> Notarizing the app"
 rm -f "$ZIP"
 /usr/bin/ditto -c -k --keepParent "$APP" "$ZIP"

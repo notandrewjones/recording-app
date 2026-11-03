@@ -26,6 +26,38 @@ public struct StoragePolicy: Hashable, Sendable {
     }
 }
 
+/// The session's write rate, averaged over a sliding window of cumulative byte counts.
+/// ffmpeg writes whole fragments in bursts, so a rate over a second or two swings by half or more.
+public struct WriteRateMeter: Sendable {
+    public var windowSeconds: Double
+    /// No rate is reported until this much writing has been seen, so ffmpeg's startup doesn't skew it.
+    public var minimumSeconds: Double
+    private var samples: [(seconds: Double, bytes: Int64)] = []
+
+    public init(windowSeconds: Double = 30, minimumSeconds: Double = 5) {
+        self.windowSeconds = windowSeconds
+        self.minimumSeconds = minimumSeconds
+    }
+
+    /// `bytes` is the total written so far. Samples before the first byte are ignored.
+    public mutating func add(seconds: Double, bytes: Int64) {
+        guard bytes > 0 else { return }
+        samples.append((seconds, bytes))
+        // Keep one sample at or before the window start, so the span covers the whole window.
+        while samples.count > 2, seconds - samples[1].seconds >= windowSeconds {
+            samples.removeFirst()
+        }
+    }
+
+    /// Bytes per second over the window, or zero until `minimumSeconds` of writing has been seen.
+    public var bytesPerSecond: Double {
+        guard let first = samples.first, let last = samples.last else { return 0 }
+        let span = last.seconds - first.seconds
+        guard span >= minimumSeconds else { return 0 }
+        return Double(max(0, last.bytes - first.bytes)) / span
+    }
+}
+
 /// How close one input is to losing frames, judged by how full its ring has become.
 public enum InputLoad: Hashable, Sendable {
     case healthy

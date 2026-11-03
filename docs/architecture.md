@@ -12,7 +12,7 @@
 
 `ISOCore` and `ISOEngine` stay free of UI and hardware imports. The engine's tests run real ffmpeg
 against synthetic sources, so everything except the capture card is tested end to end.
-`ControlServer` arrives in M4.
+`ControlServer` serves the control API (see `docs/setup.md`), and `companion-module/` is the Bitfocus Companion module that drives it.
 
 ## Process model
 
@@ -57,8 +57,13 @@ An input that arrives mid-session joins it, and one that returns reattaches to i
 
 - **Ring fill per input** is the first warning. It stays near zero until an encoder falls behind.
   Under 50% is healthy, under 90% strained, and above that frames are about to repeat.
-- **Status bar:** CPU, memory, write rate, free space and time remaining. Time remaining uses the live
-  rate while recording, and the estimate for armed inputs when idle.
+- **Toolbar:** Record/Stop, the session clock, markers, how many inputs are recording, and time remaining.
+  Time remaining uses the live rate while recording, and the estimate for armed inputs when idle, marked `≈`.
+  It turns amber under 30 minutes and red under 10.
+- **Banner:** a failed start, a missing recording folder and encoder capacity warnings show under the toolbar
+  until they are fixed or dismissed.
+- **Status bar:** codec, CPU (memory and driver version in its tooltip), write rate and free space. The
+  Desktop Video version shows here only when it is a problem.
 - **Per input:** segment, frames, repeats, gaps and restarts.
 
 A session also writes `health.jsonl`, one sample every 5 seconds. `SessionReport` reads it with the manifest
@@ -90,6 +95,9 @@ Every frame gets one 32-byte `.idx` record: frame number, host time, stream time
   sources are free-running. A nearest-frame lookup finds "the same moment" on another angle, including
   across mixed frame rates.
 - If sources are genlocked later, nothing changes. Offsets simply stay constant.
+- Each segment's tmcd track starts at the source's embedded timecode, or at time of day when there is none
+  or the input is set to Time of day (the SRC/TOD menu on its tile). Time of day is taken from the first
+  frame's host time, mapped to the wall clock, so it is the moment that frame arrived.
 
 ## Files
 

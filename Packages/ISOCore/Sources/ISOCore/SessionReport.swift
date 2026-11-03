@@ -47,6 +47,12 @@ public enum HostTime {
     public static func seconds(from start: UInt64, to end: UInt64) -> Double {
         end > start ? Double(end - start) / 1_000_000_000 : 0
     }
+
+    /// The wall-clock time of a host timestamp, from a (date, host time) pair sampled together just now.
+    /// A timestamp later than `nowHostNanos` maps to `now`, since it can only be a moment old.
+    public static func date(ofHostNanos hostNanos: UInt64, now: Date, nowHostNanos: UInt64) -> Date {
+        now.addingTimeInterval(-seconds(from: hostNanos, to: nowHostNanos))
+    }
 }
 
 /// First and last real frames of a segment, for checking frame count against elapsed time.

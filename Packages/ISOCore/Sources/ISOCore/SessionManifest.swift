@@ -58,6 +58,8 @@ public struct SessionManifest: Codable, Hashable, Sendable {
         public var audioChannels: Int
         public var startTimecode: String
         public var timecodeIsEmbedded: Bool
+        /// The input's timecode setting when the segment opened. Nil in manifests from before it existed.
+        public var timecodeSource: TimecodeSource?
         public var startHostNanos: UInt64
         public var frames: Int = 0
         public var repeatedFrames: Int = 0
@@ -66,7 +68,7 @@ public struct SessionManifest: Codable, Hashable, Sendable {
         public var state: SegmentState = .recording
         public var endReason: EndReason?
 
-        public init(number: Int, workingFile: String, finalFile: String, indexFile: String, logFile: String, format: VideoFormat, codec: Codec, audioChannels: Int, startTimecode: String, timecodeIsEmbedded: Bool, startHostNanos: UInt64) {
+        public init(number: Int, workingFile: String, finalFile: String, indexFile: String, logFile: String, format: VideoFormat, codec: Codec, audioChannels: Int, startTimecode: String, timecodeIsEmbedded: Bool, startHostNanos: UInt64, timecodeSource: TimecodeSource? = nil) {
             self.number = number
             self.workingFile = workingFile
             self.finalFile = finalFile
@@ -77,6 +79,7 @@ public struct SessionManifest: Codable, Hashable, Sendable {
             self.audioChannels = audioChannels
             self.startTimecode = startTimecode
             self.timecodeIsEmbedded = timecodeIsEmbedded
+            self.timecodeSource = timecodeSource
             self.startHostNanos = startHostNanos
         }
     }

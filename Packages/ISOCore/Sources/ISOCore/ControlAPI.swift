@@ -4,8 +4,10 @@ public enum ControlCommand: Hashable, Sendable {
     case status
     case startRecording
     case stopRecording
+    case toggleRecording
     case addMarker(label: String)
     case setArmed(inputID: String, armed: Bool)
+    case toggleArmed(inputID: String)
 }
 
 /// A small HTTP/1.1 subset, enough for Bitfocus Companion's generic HTTP module, Stream Deck and curl.
@@ -65,10 +67,12 @@ public struct ControlResponse: Hashable, Sendable {
         switch status {
         case 200: reason = "OK"
         case 400: reason = "Bad Request"
+        case 401: reason = "Unauthorized"
         case 403: reason = "Forbidden"
         case 404: reason = "Not Found"
         case 405: reason = "Method Not Allowed"
         case 409: reason = "Conflict"
+        case 503: reason = "Service Unavailable"
         default: reason = "Error"
         }
         var data = Data("HTTP/1.1 \(status) \(reason)\r\nContent-Type: application/json\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8)
@@ -83,14 +87,26 @@ public enum ControlRouter {
         case rejected(ControlResponse)
     }
 
-    public static func route(_ request: ControlRequest) -> Result {
+    /// - Parameters:
+    ///   - fromLoopback: whether the connection came from this Mac, judged by its address and not by `Host`,
+    ///     which any client other than a browser can set to anything.
+    ///   - token: the access token other computers must send, or nil when only this Mac may connect.
+    public static func route(_ request: ControlRequest, fromLoopback: Bool = true, token: String? = nil) -> Result {
         // A web page in any browser on this Mac can reach localhost. Browsers always attach Origin to a
         // cross-site POST and can't forge Host, so these two checks stop a page from controlling a recording.
         if request.headers["origin"] != nil {
             return .rejected(ControlResponse(status: 403, error: "Browser requests are not accepted."))
         }
-        guard isLocalHost(request.headers["host"]) else {
-            return .rejected(ControlResponse(status: 403, error: "Only local requests are accepted."))
+        if fromLoopback {
+            guard isLocalHost(request.headers["host"]) else {
+                return .rejected(ControlResponse(status: 403, error: "Only local requests are accepted."))
+            }
+        } else {
+            // Also what stops a DNS-rebinding page, which reaches this address without Origin on a GET.
+            guard let token, !token.isEmpty, let presented = bearerToken(request.headers["authorization"]),
+                  constantTimeEqual(presented, token) else {
+                return .rejected(ControlResponse(status: 401, error: "Missing or wrong access token."))
+            }
         }
 
         let route = request.path.split(separator: "?", maxSplits: 1).first.map(String.init) ?? request.path
@@ -104,12 +120,14 @@ public enum ControlRouter {
             return .command(.startRecording)
         case ("POST", ["record", "stop"]):
             return .command(.stopRecording)
+        case ("POST", ["record", "toggle"]):
+            return .command(.toggleRecording)
         case ("POST", ["marker"]):
             return .command(.addMarker(label: markerLabel(request.body)))
-        case ("POST", let path) where path.count == 3 && path[0] == "inputs" && (path[2] == "arm" || path[2] == "disarm"):
+        case ("POST", let path) where path.count == 3 && path[0] == "inputs" && ["arm", "disarm", "toggle"].contains(path[2]):
             let id = path[1].removingPercentEncoding ?? path[1]
-            return .command(.setArmed(inputID: id, armed: path[2] == "arm"))
-        case (_, ["status"]), (_, ["record", "start"]), (_, ["record", "stop"]), (_, ["marker"]):
+            return .command(path[2] == "toggle" ? .toggleArmed(inputID: id) : .setArmed(inputID: id, armed: path[2] == "arm"))
+        case (_, ["status"]), (_, ["record", "start"]), (_, ["record", "stop"]), (_, ["record", "toggle"]), (_, ["marker"]):
             return .rejected(ControlResponse(status: 405, error: "Method not allowed."))
         default:
             return notFound
@@ -124,6 +142,18 @@ public enum ControlRouter {
         guard let host else { return false }
         let name = host.hasPrefix("[") ? String(host.prefix { $0 != "]" }.dropFirst()) : String(host.prefix { $0 != ":" })
         return ["127.0.0.1", "localhost", "::1"].contains(name.lowercased())
+    }
+
+    private static func bearerToken(_ header: String?) -> String? {
+        guard let header, header.count > 7, header.prefix(7).lowercased() == "bearer " else { return nil }
+        return header.dropFirst(7).trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Takes the same time wherever the first difference is, so the token can't be guessed a byte at a time.
+    private static func constantTimeEqual(_ a: String, _ b: String) -> Bool {
+        let a = Array(a.utf8), b = Array(b.utf8)
+        guard a.count == b.count else { return false }
+        return zip(a, b).reduce(UInt8(0)) { $0 | ($1.0 ^ $1.1) } == 0
     }
 
     private static func markerLabel(_ body: Data) -> String {

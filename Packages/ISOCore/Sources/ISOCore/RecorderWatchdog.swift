@@ -51,6 +51,10 @@ public struct RecorderWatchdog: Hashable, Sendable {
 
         case (_, .stopRequested):
             let wasRunning = isProcessActive
+            // A segment that was opened is finished, so recording again in this session needs a new number.
+            // A segment still waiting for signal or a retry was never opened, and keeps its number.
+            if case .starting(let segment) = state { nextSegment = segment + 1 }
+            if case .recording(let segment) = state { nextSegment = segment + 1 }
             state = .idle
             return wasRunning ? [.stopProcess] : []
 
@@ -117,6 +121,8 @@ public struct RecorderWatchdog: Hashable, Sendable {
     private mutating func retry(after segment: Int, attempt: Int, reason: String) -> [Action] {
         let current = max(attempt, pendingAttempt + 1)
         guard current <= maxAttempts else {
+            // Recording again after giving up must not reopen the failed segment's files.
+            nextSegment = segment + 1
             state = .failed(reason: reason)
             return [.log("giving up after \(maxAttempts) attempts: \(reason)")]
         }

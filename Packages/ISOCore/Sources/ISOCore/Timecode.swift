@@ -29,11 +29,15 @@ public struct Timecode: Hashable, Codable, Sendable {
         self.init(frameCount: frameCount, nominalFPS: nominal, isDropFrame: drop)
     }
 
-    /// Time-of-day timecode, used when the signal carries none.
+    /// Time-of-day timecode, used when the signal carries none or the input is set to generate it.
+    /// Drop-frame numbering tracks the wall clock at the real rate. Non-drop numbering counts at the nominal
+    /// rate, so 23.976 reads the right time when it starts rather than falling behind through the day.
     public static func timeOfDay(date: Date, frameRate: Rational, calendar: Calendar = .current) -> Timecode {
         let midnight = calendar.startOfDay(for: date)
-        let seconds = date.timeIntervalSince(midnight)
-        return Timecode(frameCount: Int(seconds * frameRate.doubleValue), frameRate: frameRate)
+        let seconds = max(0, date.timeIntervalSince(midnight))
+        let mode = Timecode(frameCount: 0, frameRate: frameRate)
+        let rate = mode.isDropFrame ? frameRate.doubleValue : Double(mode.nominalFPS)
+        return Timecode(frameCount: Int(seconds * rate), nominalFPS: mode.nominalFPS, isDropFrame: mode.isDropFrame)
     }
 
     public func advanced(by frames: Int) -> Timecode {
@@ -66,5 +70,29 @@ public struct Timecode: Hashable, Codable, Sendable {
 
     private static func droppedPerMinute(_ nominalFPS: Int) -> Int {
         nominalFPS == 60 ? 4 : 2
+    }
+}
+
+/// Where an input's recorded timecode comes from.
+public enum TimecodeSource: String, Codable, Sendable, CaseIterable, Identifiable {
+    /// The signal's embedded timecode, or time of day when it carries none.
+    case source
+    /// Always time of day from this Mac's clock, ignoring any embedded timecode.
+    case timeOfDay
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .source: "Source timecode (time of day if none)"
+        case .timeOfDay: "Time of day"
+        }
+    }
+
+    public var shortLabel: String {
+        switch self {
+        case .source: "SRC"
+        case .timeOfDay: "TOD"
+        }
     }
 }
