@@ -132,11 +132,19 @@ public struct SessionReport: Sendable {
         let unfinished = input.segments.filter { $0.state != .finalized }.count
         let failures = input.segments.filter { $0.endReason == .recorderFailed }.count
         let signal = input.events.filter { $0.kind == "signal_lost" }.count
+        let slow = input.events.filter { $0.kind == "output_slow" }.count
+        let unlocked = input.events.filter { $0.kind == "ring_memory" && $0.detail?.hasPrefix("locked") == false }.count
+        let finalizeReason = input.segments.compactMap(\.finalizeError).first
 
         if repeated > 0 { findings.append(Finding(severity: .failure, message: "\(input.label): \(repeated) repeated frames.")) }
         if lost > 0 { findings.append(Finding(severity: .failure, message: "\(input.label): \(lost) frames lost in a crash.")) }
         if failures > 0 { findings.append(Finding(severity: .failure, message: "\(input.label): recorder failed \(failures) times.")) }
-        if unfinished > 0 { findings.append(Finding(severity: .failure, message: "\(input.label): \(unfinished) segments not finalized.")) }
+        if unfinished > 0 {
+            let reason = finalizeReason.map { " First reason: \($0)." } ?? ""
+            findings.append(Finding(severity: .failure, message: "\(input.label): \(unfinished) segments not finalized.\(reason)"))
+        }
+        if slow > 0 { findings.append(Finding(severity: .warning, message: "\(input.label): ffmpeg fell behind \(slow) times.")) }
+        if unlocked > 0 { findings.append(Finding(severity: .warning, message: "\(input.label): frame ring could not be locked in memory.")) }
         if signal > 0 { findings.append(Finding(severity: .warning, message: "\(input.label): signal lost \(signal) times.")) }
     }
 
@@ -153,6 +161,10 @@ public struct SessionReport: Sendable {
         }
         if health.contains(where: { $0.memoryPressure >= 4 }) {
             findings.append(Finding(severity: .warning, message: "Memory pressure reached critical."))
+        }
+        let pressured = Double(health.filter { $0.memoryPressure >= 2 }.count) / Double(health.count)
+        if pressured >= 0.1 {
+            findings.append(Finding(severity: .warning, message: String(format: "Memory pressure was raised for %.0f%% of the run.", pressured * 100)))
         }
         checkGrowth(health, name: "App memory", value: \.appResidentBytes)
         checkGrowth(health, name: "ffmpeg memory", value: \.ffmpegResidentBytes)

@@ -22,6 +22,8 @@ typedef struct {
     int32_t width;
     int32_t height;
     bool hasSignal;
+    /// v210 when true, 8-bit UYVY when false. Read from each frame, so a frame is never mislabelled.
+    bool isTenBit;
     uint64_t hostTimeNanos;
     int64_t streamTime;
     int64_t streamTimeScale;
@@ -45,8 +47,11 @@ typedef void (^DLFormatHandler)(DLFormat format);
 @property (nonatomic, readonly) NSString *modelName;
 @property (nonatomic, readonly) int32_t maxAudioChannels;
 @property (nonatomic, readonly) BOOL supportsFormatDetection;
+/// v210 when YES (the default), 8-bit UYVY when NO. Takes effect at the next start.
+@property (nonatomic) BOOL captureTenBit;
 
-/// Captures v210. With format detection the input follows the signal; otherwise it stays at 1080p59.94.
+/// Captures in the pixel format `captureTenBit` selects. With format detection the input follows the signal;
+/// otherwise it stays at 1080p59.94.
 - (BOOL)startWithAudioChannels:(int32_t)audioChannels
                   frameHandler:(DLFrameHandler)frameHandler
                  formatHandler:(DLFormatHandler)formatHandler

@@ -79,3 +79,20 @@ public final class SystemMetrics {
         return (pages * UInt64(pageSize), total)
     }
 }
+
+/// Another process's total CPU time. The kernel reports it in Mach ticks, which are not nanoseconds on
+/// Apple silicon (125/3 per tick on an M2 Pro).
+enum ProcessCPU {
+    private static let timebase: (numer: UInt64, denom: UInt64) = {
+        var info = mach_timebase_info()
+        mach_timebase_info(&info)
+        return (UInt64(info.numer), UInt64(max(info.denom, 1)))
+    }()
+
+    static func nanoseconds(_ pid: Int32) -> UInt64? {
+        var info = proc_taskinfo()
+        let size = Int32(MemoryLayout<proc_taskinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &info, size) == size else { return nil }
+        return (info.pti_total_user + info.pti_total_system) * timebase.numer / timebase.denom
+    }
+}

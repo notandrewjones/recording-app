@@ -110,4 +110,22 @@ import Testing
     @Test func emptyRingTimesOut() {
         if case .timedOut = ring().next(.video, timeout: 0.01) {} else { Issue.record("expected timeout") }
     }
+
+    @Test func ringIsWiredIntoMemory() {
+        let budget = MemoryLockBudget(limitBytes: 1 << 30)
+        var ring: FrameRing? = FrameRing(format: format, slotCount: 4, audioSlotBytes: 16, budget: budget)
+        #expect(ring?.memoryLock == .locked)
+        #expect(budget.usedBytes == ring?.storageBytes)
+        ring = nil
+        #expect(budget.usedBytes == 0)
+    }
+
+    @Test func ringOverBudgetStillWorksUnlocked() {
+        let budget = MemoryLockBudget(limitBytes: 16)
+        let ring = FrameRing(format: format, slotCount: 4, audioSlotBytes: 16, budget: budget)
+        #expect(ring.memoryLock == .overBudget)
+        #expect(budget.usedBytes == 0)
+        push(ring, 7)
+        #expect(firstByte(entry(ring, .video)) == 7)
+    }
 }

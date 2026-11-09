@@ -22,6 +22,34 @@ public final class UnfairLock: @unchecked Sendable {
     }
 }
 
+/// Caps how much memory the rings may wire, so that several large inputs cannot pin most of the machine.
+/// A quarter of RAM covers five 1080p v210 inputs, or one 2160p v210 input.
+public final class MemoryLockBudget: @unchecked Sendable {
+    public static let shared = MemoryLockBudget(limitBytes: Int(ProcessInfo.processInfo.physicalMemory / 4))
+
+    public let limitBytes: Int
+    private let lock = UnfairLock()
+    private var used = 0
+
+    public init(limitBytes: Int) {
+        self.limitBytes = limitBytes
+    }
+
+    public var usedBytes: Int { lock.withLock { used } }
+
+    func reserve(_ bytes: Int) -> Bool {
+        lock.withLock {
+            guard used + bytes <= limitBytes else { return false }
+            used += bytes
+            return true
+        }
+    }
+
+    func release(_ bytes: Int) {
+        lock.withLock { used -= bytes }
+    }
+}
+
 /// Fixed-memory ring between one capture thread and two writer threads, one each for video and audio.
 ///
 /// Readers advance independently, so a slow audio socket does not hold up video until the ring fills.
@@ -61,12 +89,31 @@ public final class FrameRing: @unchecked Sendable {
         case closed
     }
 
+    /// Whether the ring is wired into RAM. Under memory pressure macOS compresses or swaps unwired pages, and
+    /// then every frame copied in or out waits on the pager: on an 8 GB Mac that stalled capture and ffmpeg.
+    public enum MemoryLock: Hashable, Sendable, CustomStringConvertible {
+        case locked
+        case overBudget
+        case failed(errno: Int32)
+
+        public var description: String {
+            switch self {
+            case .locked: "locked"
+            case .overBudget: "not locked: over the memory lock budget"
+            case .failed(let code): "not locked: \(String(cString: strerror(code)))"
+            }
+        }
+    }
+
     public let format: VideoFormat
     public let slotCount: Int
     public let audioSlotBytes: Int
 
+    public let memoryLock: MemoryLock
+    public let storageBytes: Int
     private let storage: UnsafeMutableRawPointer
     private let slotBytes: Int
+    private let budget: MemoryLockBudget
     private var metadata: [Metadata]
     private var audioByteCounts: [Int]
     private var missingCounts: [Int]
@@ -78,7 +125,7 @@ public final class FrameRing: @unchecked Sendable {
     private var pendingMissing = 0
     private let wakeups = [DispatchSemaphore(value: 0), DispatchSemaphore(value: 0)]
 
-    public init(format: VideoFormat, slotCount: Int, audioSlotBytes: Int) {
+    public init(format: VideoFormat, slotCount: Int, audioSlotBytes: Int, budget: MemoryLockBudget = .shared) {
         precondition(slotCount >= 3, "A ring needs room for a held frame and two in flight")
         self.format = format
         self.slotCount = slotCount
@@ -88,13 +135,34 @@ public final class FrameRing: @unchecked Sendable {
         metadata = Array(repeating: placeholder, count: slotCount)
         audioByteCounts = Array(repeating: 0, count: slotCount)
         missingCounts = Array(repeating: 0, count: slotCount)
-        storage = UnsafeMutableRawPointer.allocate(byteCount: slotBytes * slotCount, alignment: 64)
-        // Touch every page now, so the capture thread never takes a page fault on its first pass.
-        memset(storage, 0, slotBytes * slotCount)
+        self.budget = budget
+        storageBytes = slotBytes * slotCount
+        // Its own mapping, so locking and unlocking it touches no page another allocation shares.
+        let mapped = mmap(nil, storageBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0)
+        precondition(mapped != MAP_FAILED, "Could not map \(storageBytes) bytes for a frame ring")
+        storage = mapped!
+
+        if !budget.reserve(storageBytes) {
+            memoryLock = .overBudget
+        } else if mlock(storage, storageBytes) == 0 {
+            // Wiring faults every page in, so nothing is left to fault on the capture thread.
+            memoryLock = .locked
+        } else {
+            memoryLock = .failed(errno: errno)
+            budget.release(storageBytes)
+        }
+        if memoryLock != .locked {
+            // Touch every page now, so the capture thread never takes a page fault on its first pass.
+            memset(storage, 0, storageBytes)
+        }
     }
 
     deinit {
-        storage.deallocate()
+        if memoryLock == .locked {
+            munlock(storage, storageBytes)
+            budget.release(storageBytes)
+        }
+        munmap(storage, storageBytes)
     }
 
     private func slotPointer(_ position: UInt64) -> UnsafeMutableRawPointer {

@@ -147,6 +147,7 @@ final class AppModel: ObservableObject {
                 self?.refreshMetrics()
             }
         }
+        outputSettings.onChange = { [weak self] in self?.applyCapturePixelLayouts() }
         recoverInterruptedSessions()
         scheduleAutoRecord()
         startControlServer()
@@ -645,12 +646,26 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Matches each idle input's capture format to its codec: 8-bit for H.264, 10-bit for everything else.
+    /// Settings are locked while recording, and an input that is recording is never restarted.
+    private func applyCapturePixelLayouts() {
+        for tile in tiles where !tile.isRecording {
+            do {
+                try tile.source.setPixelLayout(outputSettings.settings(for: tile.id).codec.sourcePixelLayout)
+            } catch {
+                tile.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
     private func add(_ source: CaptureSource) {
         guard !tiles.contains(where: { $0.id == source.input.id }) else { return }
         let tile = InputTile(source: source, name: inputNames.name(for: source.input), timecodeSource: inputTimecodeSources.source(for: source.input.id))
         tiles.append(tile)
         joinSession(tile)
         do {
+            // Not running yet, so this only chooses the format the first start asks for.
+            try source.setPixelLayout(outputSettings.settings(for: source.input.id).codec.sourcePixelLayout)
             try source.start()
         } catch {
             tile.errorMessage = error.localizedDescription

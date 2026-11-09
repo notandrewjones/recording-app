@@ -29,8 +29,12 @@ protocol CaptureSource: AnyObject {
     var sink: RecorderSink { get }
     /// Channels this source records, as a count ffmpeg can accept.
     var audioChannels: Int { get }
+    /// The pixel layout this source delivers, chosen to match what the encoder needs.
+    var pixelLayout: PixelLayout { get }
     func start() throws
     func stop()
+    /// Restarts capture if it is running. Only called between recordings, since a new layout is a new format.
+    func setPixelLayout(_ layout: PixelLayout) throws
 }
 
 final class DeckLinkCaptureSource: CaptureSource {
@@ -38,6 +42,8 @@ final class DeckLinkCaptureSource: CaptureSource {
     let store = PreviewFrameStore()
     let sink = RecorderSink()
     let device: DLInput
+    private(set) var pixelLayout = PixelLayout.v210
+    private var isRunning = false
 
     init(device: DLInput) {
         self.device = device
@@ -53,16 +59,27 @@ final class DeckLinkCaptureSource: CaptureSource {
         FFmpegCommand.supportedAudioChannelCounts.last { $0 <= input.maxAudioChannels } ?? 2
     }
 
+    func setPixelLayout(_ layout: PixelLayout) throws {
+        guard layout != pixelLayout else { return }
+        pixelLayout = layout
+        guard isRunning else { return }
+        stop()
+        try start()
+    }
+
     func start() throws {
         let store = store
         let sink = sink
         // Written by the format handler on the capture thread, which is also the only reader.
         var format = VideoFormat.hd1080p5994
+        device.captureTenBit = pixelLayout == .v210
         try device.start(
             withAudioChannels: Int32(audioChannels),
             frameHandler: { info, video, audio in
-                let current = format
                 let frame = info.pointee
+                var current = format
+                // Each frame says what it is, so frames still in flight from before a restart are labelled right.
+                current.pixelLayout = frame.isTenBit ? .v210 : .uyvy422
                 guard frame.rowBytes == current.rowBytes, Int(frame.height) == current.height else { return }
                 let timecode = Self.timecode(frame, rate: current.frameRate)
                 store.offer(format: current, bytes: video, timecode: timecode, hasSignal: frame.hasSignal)
@@ -82,9 +99,11 @@ final class DeckLinkCaptureSource: CaptureSource {
                 format = VideoFormat(dlFormat)
             }
         )
+        isRunning = true
     }
 
     func stop() {
+        isRunning = false
         device.stop()
     }
 
@@ -128,8 +147,10 @@ final class SyntheticCaptureSource: CaptureSource {
     let store = PreviewFrameStore()
     let sink = RecorderSink()
     let audioChannels = 16
-    private let format: VideoFormat
+    private var format: VideoFormat
     private var source: SyntheticSource?
+
+    var pixelLayout: PixelLayout { format.pixelLayout }
 
     init(index: Int, format: VideoFormat = .hd1080p5994) {
         self.format = format
@@ -150,7 +171,8 @@ final class SyntheticCaptureSource: CaptureSource {
             format: format,
             audioChannels: audioChannels,
             timecodeStart: Timecode.timeOfDay(date: Date(), frameRate: format.frameRate),
-            pool: Self.grainPool
+            // Grain exists only for v210.
+            pool: format.pixelLayout == .v210 ? Self.grainPool : nil
         )
         source.onFrame = { frame in
             store.offer(format: frame.format, bytes: frame.video, timecode: frame.timecode, hasSignal: frame.hasSignal)
@@ -163,5 +185,11 @@ final class SyntheticCaptureSource: CaptureSource {
     func stop() {
         source?.cancel()
         source = nil
+    }
+
+    func setPixelLayout(_ layout: PixelLayout) {
+        guard layout != format.pixelLayout else { return }
+        format.pixelLayout = layout
+        if source != nil { start() }
     }
 }

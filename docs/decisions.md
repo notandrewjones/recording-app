@@ -254,6 +254,52 @@ which carry the time of the frame that ended the gap. It now measures to the las
 
 The two-hour run still has to be repeated on mains power.
 
+## First live recording: 90 stall restarts on an 8 GB M1
+
+On 2026-11-08, two DeckLink inputs ran for 98 minutes at 1080p59.94 into H.264 hardware on an 8 GB M1.
+Every part ended with the 5-second "output stalled" kill: 47 on Program and 43 on Multiview.
+
+- The first 27 minutes were clean: ring empty, CPU about 25%, no repeats.
+- After that both inputs degraded together. Rings filled at the same moment and the first drops matched
+  frame for frame on both inputs. Some kills landed in the same millisecond.
+- Memory pressure was at warning from the first sample, with 6.4 to 6.8 GB in use. Around stalls the
+  app's resident memory fell from about 900 MB to as little as 320 MB, which means its rings were being
+  compressed or swapped.
+- About 8% of frames per input were repeats, and 19 parts per input were left as `.part.mov`.
+
+The five-input soak's slowdown at 77 minutes looked the same, so low battery may not explain it either.
+
+Changes made in response:
+
+- **Capture 8-bit for H.264.** The card was always asked for v210, but H.264 here is 8-bit 4:2:0. Inputs
+  now capture UYVY when their codec is H.264, which cuts the ring and the socket traffic by a quarter and
+  drops a 10-bit unpack in ffmpeg. ProRes, HEVC and x265 keep v210. Settings are locked while recording,
+  so the capture format only changes between recordings.
+- **Rings are wired with `mlock`.** A ring that the pager can take turns every frame copy into a page
+  fault. Wiring is capped at a quarter of RAM across all rings, so several 2160p inputs cannot pin most
+  of the machine. A ring over the cap still works, unlocked. Each ring logs a `ring_memory` event saying
+  which it got.
+- **Rings were leaking.** Each `SegmentRecorder` kept itself alive through its own callbacks, so every
+  session kept its rings, about 340 MB per 1080p v210 input, until the app quit. The callbacks are now
+  dropped when the segment ends.
+
+- **ffmpeg is replaced only when it is stuck, not slow.** The 5-second "no output" kill lost each
+  recorder's unwritten fragment and started a new ffmpeg, about 300 MB, when memory was shortest.
+  `StallDetector` now watches output growth, frames ffmpeg accepts, and its CPU time. While any of
+  them moves, ffmpeg is left alone and the ring drops frames until it catches up, logging
+  `output_slow` and `output_resumed`. It is replaced after 10 seconds with no sign of life, or
+  30 seconds with no output whatever else it is doing (`output_stuck`). A truly hung ffmpeg now costs
+  up to 10 seconds instead of 5.
+- **Crashed parts failed to finalize because of a parsing bug.** ffprobe's stderr shared a pipe with its
+  answer, and after a kill it warns about the cut-off last frame before printing the count. The
+  warning was parsed as the frame count, so finalizing gave up on files that were fine. 14 of 24
+  random kills of a live ffmpeg hit this, against about 40% of the M1's killed parts. stderr is now
+  separate. A file cut inside a fragment header, which ffprobe really cannot open, is finalized from a
+  clone cut back to its last complete fragment. A part that still fails says why in `finalizeError`.
+  Recovery at launch retries unfinished parts, so earlier sessions are repaired by the new build.
+
+None of this is proven against the original failure until a long recording passes on the 8 GB M1.
+
 ## DeckLink headers are vendored and library validation is off in release builds
 
 CI has no SDK download, and GitHub secrets are too small to hold it. The headers' own licence allows

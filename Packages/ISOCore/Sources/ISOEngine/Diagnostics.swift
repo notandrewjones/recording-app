@@ -154,7 +154,7 @@ public enum DiagnosticsBundle {
 
     private static func systemDescription(environment: FFmpegEnvironment?, sessionDirectory: String) -> String {
         func command(_ path: String, _ arguments: [String]) -> String {
-            ((try? ProcessRunner.run(path, arguments))?.output ?? "unavailable").trimmingCharacters(in: .whitespacesAndNewlines)
+            ((try? ProcessRunner.run(path, arguments))?.combinedOutput ?? "unavailable").trimmingCharacters(in: .whitespacesAndNewlines)
         }
         var sections = [
             "macOS:\n\(command("/usr/bin/sw_vers", []))",

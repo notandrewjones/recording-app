@@ -31,18 +31,25 @@ public struct InputRecorderSettings: Sendable {
     public var codec: Codec
     public var audio: AudioFormat?
     public var ringSeconds: Double
+    /// No sign of life from ffmpeg for this long, in output, input or CPU, means it is stuck and is replaced.
     public var stallSeconds: Double
+    /// No output for this long means ffmpeg is replaced even if it still looks busy.
+    public var hardStallSeconds: Double
+    /// No output for this long, while ffmpeg is still working, is logged as falling behind.
+    public var slowSeconds: Double
     public var signalTimeoutSeconds: Double
     public var fullSyncSeconds: Double
     public var allowSoftwareProRes: Bool
     /// Where each segment's starting timecode comes from. `InputRecorder.setTimecodeSource` changes it later.
     public var timecodeSource: TimecodeSource
 
-    public init(codec: Codec = .proResLT, audio: AudioFormat? = AudioFormat(channels: 16), ringSeconds: Double = 1, stallSeconds: Double = 5, signalTimeoutSeconds: Double = 1, fullSyncSeconds: Double = 2, allowSoftwareProRes: Bool = false, timecodeSource: TimecodeSource = .source) {
+    public init(codec: Codec = .proResLT, audio: AudioFormat? = AudioFormat(channels: 16), ringSeconds: Double = 1, stallSeconds: Double = 10, signalTimeoutSeconds: Double = 1, fullSyncSeconds: Double = 2, allowSoftwareProRes: Bool = false, timecodeSource: TimecodeSource = .source, hardStallSeconds: Double = 30, slowSeconds: Double = 5) {
         self.codec = codec
         self.audio = audio
         self.ringSeconds = ringSeconds
         self.stallSeconds = stallSeconds
+        self.hardStallSeconds = hardStallSeconds
+        self.slowSeconds = slowSeconds
         self.signalTimeoutSeconds = signalTimeoutSeconds
         self.fullSyncSeconds = fullSyncSeconds
         self.allowSoftwareProRes = allowSoftwareProRes
@@ -99,7 +106,9 @@ public final class InputRecorder: @unchecked Sendable {
     private var closingReason: SessionManifest.EndReason = .stopped
     private var monitor: DispatchSourceTimer?
     private var lastBytes: Int64 = 0
-    private var lastGrowthUptime: UInt64 = 0
+    private var stall: StallDetector
+    /// When the current recorder started falling behind, for the event logged once it catches up.
+    private var slowSinceUptime: UInt64?
     private var lastSyncUptime: UInt64 = 0
     private var healthySinceUptime: UInt64?
     private var bytesWritten: Int64 = 0
@@ -116,6 +125,7 @@ public final class InputRecorder: @unchecked Sendable {
         self.label = label
         self.settings = settings
         timecodeSource = settings.timecodeSource
+        stall = StallDetector(slowSeconds: settings.slowSeconds, hungSeconds: settings.stallSeconds, hardSeconds: settings.hardStallSeconds)
         self.store = store
         self.finalizer = finalizer
         self.environment = environment
@@ -331,8 +341,10 @@ public final class InputRecorder: @unchecked Sendable {
         }
         recorder.onConnected = { [self] in
             queue.async { [self] in
-                lastGrowthUptime = DispatchTime.now().uptimeNanoseconds
-                healthySinceUptime = lastGrowthUptime
+                let now = DispatchTime.now().uptimeNanoseconds
+                stall.reset(now: Self.seconds(now))
+                slowSinceUptime = nil
+                healthySinceUptime = now
                 send(.processStarted)
             }
         }
@@ -356,6 +368,7 @@ public final class InputRecorder: @unchecked Sendable {
         let slots = max(4, Int((rate * settings.ringSeconds).rounded(.up))) + 1
         let audioBytes = AudioCadence.maximumSamplesPerFrame(frameRate: format.frameRate) * (settings.audio?.channels ?? 0) * 4
         let ring = FrameRing(format: format, slotCount: slots, audioSlotBytes: audioBytes)
+        log("ring_memory", detail: "\(ring.memoryLock), \(ring.storageBytes / 1_048_576) MB")
         let fill = max(1, Int(rate * 2))
         lock.withLock {
             self.ring = ring
@@ -487,13 +500,36 @@ public final class InputRecorder: @unchecked Sendable {
         if bytes > lastBytes {
             bytesWritten += bytes - lastBytes
             lastBytes = bytes
-            lastGrowthUptime = now
         }
 
-        // An empty ring means the source paused, which is not ffmpeg's fault.
-        if case .recording = watchdog.state, queued > 0, HostTime.seconds(from: lastGrowthUptime, to: now) > settings.stallSeconds {
-            send(.outputStalled)
-            return
+        if case .recording = watchdog.state {
+            let verdict = stall.observe(
+                now: Self.seconds(now),
+                outputBytes: bytes,
+                inputFrames: current.counters.frames,
+                cpuNanos: current.processIdentifier.flatMap(ProcessCPU.nanoseconds),
+                backlog: queued > 0
+            )
+            switch verdict {
+            case .hung:
+                log("output_stuck", detail: String(
+                    format: "no output for %.1f s, no sign of life for %.1f s",
+                    stall.secondsWithoutOutput(now: Self.seconds(now)), stall.secondsWithoutProgress(now: Self.seconds(now))
+                ))
+                slowSinceUptime = nil
+                send(.outputStalled)
+                return
+            case .slow:
+                if slowSinceUptime == nil {
+                    slowSinceUptime = now
+                    log("output_slow", detail: String(format: "ring %.0f%%", fill * 100))
+                }
+            case .healthy:
+                if let since = slowSinceUptime {
+                    log("output_resumed", detail: String(format: "after %.1f s", HostTime.seconds(from: since, to: now)))
+                    slowSinceUptime = nil
+                }
+            }
         }
 
         if let since = healthySinceUptime, HostTime.seconds(from: since, to: now) > 30 {
@@ -510,6 +546,10 @@ public final class InputRecorder: @unchecked Sendable {
                 Self.fullSync(index)
             }
         }
+    }
+
+    private static func seconds(_ uptimeNanos: UInt64) -> Double {
+        Double(uptimeNanos) / 1_000_000_000
     }
 
     /// ffmpeg never forces data to the drive, so without this a power cut could lose more than the last fragment.

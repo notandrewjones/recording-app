@@ -30,8 +30,8 @@ static DLFormat DLFormatFromMode(IDeckLinkDisplayMode *mode) {
 
 class DLInputCallback final : public IDeckLinkInputCallback {
 public:
-    DLInputCallback(IDeckLinkInput *input, DLFrameHandler frameHandler, DLFormatHandler formatHandler)
-        : input_(input), frameHandler_(frameHandler), formatHandler_(formatHandler) {}
+    DLInputCallback(IDeckLinkInput *input, BMDPixelFormat pixelFormat, DLFrameHandler frameHandler, DLFormatHandler formatHandler)
+        : input_(input), pixelFormat_(pixelFormat), frameHandler_(frameHandler), formatHandler_(formatHandler) {}
 
     HRESULT QueryInterface(REFIID, LPVOID *ppv) override {
         *ppv = nullptr;
@@ -46,7 +46,7 @@ public:
 
     HRESULT VideoInputFormatChanged(BMDVideoInputFormatChangedEvents, IDeckLinkDisplayMode *mode, BMDDetectedVideoInputFormatFlags) override {
         input_->PauseStreams();
-        input_->EnableVideoInput(mode->GetDisplayMode(), bmdFormat10BitYUV, bmdVideoInputEnableFormatDetection);
+        input_->EnableVideoInput(mode->GetDisplayMode(), pixelFormat_, bmdVideoInputEnableFormatDetection);
         input_->FlushStreams();
         input_->StartStreams();
         formatHandler_(DLFormatFromMode(mode));
@@ -68,6 +68,7 @@ public:
                 info.width = (int32_t)frame->GetWidth();
                 info.height = (int32_t)frame->GetHeight();
                 info.hasSignal = (frame->GetFlags() & bmdFrameHasNoInputSource) == 0;
+                info.isTenBit = frame->GetPixelFormat() == bmdFormat10BitYUV;
                 info.hostTimeNanos = hostTime;
                 info.streamTimeScale = 240000;
                 BMDTimeValue duration = 0;
@@ -101,6 +102,7 @@ private:
 
     std::atomic<ULONG> refCount_{1};
     IDeckLinkInput *input_;
+    const BMDPixelFormat pixelFormat_;
     DLFrameHandler frameHandler_;
     DLFormatHandler formatHandler_;
 };
@@ -148,6 +150,7 @@ private:
     bool detection = false;
     attributes->GetFlag(BMDDeckLinkSupportsInputFormatDetection, &detection);
     _supportsFormatDetection = detection;
+    _captureTenBit = YES;
 
     // Sub-devices of one card can share a persistent ID, so the sub-device index is part of identity.
     int64_t persistentID = 0;
@@ -180,8 +183,9 @@ private:
 
     const BMDDisplayMode initialMode = bmdModeHD1080p5994;
     BMDVideoInputFlags flags = _supportsFormatDetection ? bmdVideoInputEnableFormatDetection : bmdVideoInputFlagDefault;
+    const BMDPixelFormat pixelFormat = _captureTenBit ? bmdFormat10BitYUV : bmdFormat8BitYUV;
 
-    HRESULT result = _input->EnableVideoInput(initialMode, bmdFormat10BitYUV, flags);
+    HRESULT result = _input->EnableVideoInput(initialMode, pixelFormat, flags);
     if (result != S_OK) {
         if (error) *error = DLError(@"Could not enable video input. It may be in use by another application.", result);
         return NO;
@@ -195,7 +199,7 @@ private:
         }
     }
 
-    _callback = new DLInputCallback(_input, frameHandler, formatHandler);
+    _callback = new DLInputCallback(_input, pixelFormat, frameHandler, formatHandler);
     _input->SetCallback(_callback);
     result = _input->StartStreams();
     if (result != S_OK) {

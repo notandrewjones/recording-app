@@ -13,6 +13,8 @@ final class OutputSettingsStore: ObservableObject {
 
     @Published var defaults: OutputSettings { didSet { save() } }
     @Published private(set) var overrides: [String: OutputSettings] { didSet { save() } }
+    /// Called after any change, once the new value is in place.
+    var onChange: (() -> Void)?
 
     init() {
         let saved = UserDefaults.standard.data(forKey: Self.key).flatMap { try? JSONDecoder().decode(Saved.self, from: $0) }
@@ -33,6 +35,7 @@ final class OutputSettingsStore: ObservableObject {
     }
 
     private func save() {
+        onChange?()
         guard let data = try? JSONEncoder().encode(Saved(defaults: defaults, overrides: overrides)) else { return }
         UserDefaults.standard.set(data, forKey: Self.key)
     }

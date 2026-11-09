@@ -37,29 +37,91 @@ public final class Finalizer: @unchecked Sendable {
 
         var state = SessionManifest.SegmentState.finalizeFailed
         var frames = segment.frames
-        var lost = 0
+        var lost = segment.lostFrames
+        var failure: String?
+        var salvage: String?
         defer {
+            if let salvage { unlink(salvage) }
             store.updateSegment(inputID: inputID, number: number) {
                 $0.state = state
                 $0.frames = frames
                 $0.lostFrames = lost
+                $0.finalizeError = failure
             }
         }
 
-        guard let expected = try? MediaProbe.videoFrameCount(working, environment: environment), expected > 0 else { return }
+        var source = working
+        let expected: Int
+        do {
+            expected = try MediaProbe.videoFrameCount(working, environment: environment)
+        } catch {
+            // A cut inside a fragment header hides the whole file from ffprobe. A copy cut back to the last
+            // complete fragment reads, and loses only that unfinished fragment.
+            guard let copy = salvageCopy(of: working) else {
+                failure = "could not read the recording (\(error))"
+                return
+            }
+            salvage = copy
+            guard let count = try? MediaProbe.videoFrameCount(copy, environment: environment) else {
+                failure = "could not read the recording, even cut back to its last complete fragment (\(error))"
+                return
+            }
+            source = copy
+            expected = count
+        }
+        guard expected > 0 else {
+            failure = "the recording has no video frames"
+            return
+        }
         frames = expected
         lost = trimIndex(store.layout.absolutePath(segment.indexFile), toFrames: expected)
-        guard hasRoom(forCopyOf: working, near: final) else { return }
+        guard hasRoom(forCopyOf: source, near: final) else {
+            failure = "not enough free space to finalize"
+            return
+        }
 
-        let arguments = FFmpegCommand.finalizeArguments(input: working, output: final, startTimecode: segment.startTimecode)
-        guard let result = try? ProcessRunner.run(environment.ffmpegPath, arguments), result.status == 0,
-              let actual = try? MediaProbe.videoFrameCount(final, environment: environment), actual == expected
-        else {
+        let arguments = FFmpegCommand.finalizeArguments(input: source, output: final, startTimecode: segment.startTimecode)
+        let result: ProcessRunner.Result
+        do {
+            result = try ProcessRunner.run(environment.ffmpegPath, arguments)
+        } catch {
+            failure = "could not run ffmpeg (\(error))"
+            return
+        }
+        guard result.status == 0 else {
             unlink(final)
+            let message = result.errorOutput.split(whereSeparator: \.isNewline).last.map(String.init) ?? ""
+            failure = "remux failed with exit \(result.status): \(message)"
+            return
+        }
+        let actual = (try? MediaProbe.videoFrameCount(final, environment: environment)) ?? 0
+        guard actual == expected else {
+            unlink(final)
+            failure = "remux kept \(actual) of \(expected) frames"
             return
         }
         unlink(working)
         state = .finalized
+    }
+
+    /// A hidden copy of `path` cut back to its last complete fragment, or nil if cutting would not help.
+    /// APFS clones it for free; other volumes get a real copy, since the original is never modified.
+    private func salvageCopy(of path: String) -> String? {
+        var info = stat()
+        guard stat(path, &info) == 0,
+              let length = FragmentedMovie.readableLength(path: path), length > 0, length < Int64(info.st_size)
+        else { return nil }
+        let directory = (path as NSString).deletingLastPathComponent
+        let copy = (directory as NSString).appendingPathComponent(".\((path as NSString).lastPathComponent).salvage.mov")
+        unlink(copy)
+        if clonefile(path, copy, 0) != 0 {
+            guard (try? FileManager.default.copyItem(atPath: path, toPath: copy)) != nil else { return nil }
+        }
+        guard truncate(copy, off_t(length)) == 0 else {
+            unlink(copy)
+            return nil
+        }
+        return copy
     }
 
     /// After a crash the index runs ahead of the media by whatever ffmpeg never flushed. Trimming it

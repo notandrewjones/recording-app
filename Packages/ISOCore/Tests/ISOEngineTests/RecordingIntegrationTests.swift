@@ -322,6 +322,34 @@ import Testing
         #expect(total > 280)
     }
 
+    /// The old 5-second rule killed this. A frozen ffmpeg that comes back carries on in the same file, with
+    /// repeats covering the frames the ring had to drop.
+    @Test func briefFreezeIsWaitedOutWithoutARestart() throws {
+        let harness = try Harness(environment: environment, source: SyntheticSource())
+        harness.source.start(frames: 780)
+        Thread.sleep(forTimeInterval: 0.1)
+        harness.recorder.startRecording()
+        Thread.sleep(forTimeInterval: 1.5)
+        let pid = try #require(harness.recorder.status().ffmpegProcessIdentifier)
+        #expect(kill(pid, SIGSTOP) == 0)
+        Thread.sleep(forTimeInterval: 7)
+        #expect(kill(pid, SIGCONT) == 0)
+        harness.source.waitUntilFinished()
+        Thread.sleep(forTimeInterval: 0.2)
+        harness.finish()
+
+        #expect(harness.recorder.status().restarts == 0)
+        #expect(harness.segments.count == 1)
+        let segment = try #require(harness.segments.first)
+        #expect(segment.state == .finalized)
+        #expect(segment.repeatedFrames > 300)
+        #expect(harness.indexRecords(segment).count == segment.frames)
+        let kinds = harness.session.store.snapshot.inputs.first?.events.map(\.kind) ?? []
+        #expect(kinds.contains("output_slow"))
+        #expect(kinds.contains("output_resumed"))
+        #expect(!kinds.contains("output_stuck"))
+    }
+
     @Test func hungFFmpegIsDetectedAndReplaced() throws {
         let settings = InputRecorderSettings(stallSeconds: 1, fullSyncSeconds: 0)
         let harness = try Harness(environment: environment, settings: settings, source: SyntheticSource())
@@ -486,7 +514,7 @@ import Testing
     @Test func driveFillingStopsCleanlyAndKeepsTheFootage() throws {
         let image = (NSTemporaryDirectory() as NSString).appendingPathComponent("isorec-\(UUID().uuidString).dmg")
         let create = try ProcessRunner.run("/usr/bin/hdiutil", ["create", "-size", "400m", "-fs", "APFS", "-volname", "ISORecTest", "-ov", image])
-        try #require(create.status == 0, "\(create.output)")
+        try #require(create.status == 0, "\(create.combinedOutput)")
         defer { try? FileManager.default.removeItem(atPath: image) }
         let attach = try ProcessRunner.run("/usr/bin/hdiutil", ["attach", "-nobrowse", image])
         try #require(attach.status == 0, "\(attach.output)")
@@ -563,6 +591,41 @@ import Testing
         #expect(segment.lostFrames == 0)
     }
 
+    /// A leaked ring stays wired for the life of the app: every session used to keep about 340 MB per input.
+    @Test func ringsAreFreedWhenASessionEnds() throws {
+        let before = MemoryLockBudget.shared.usedBytes
+        let harness = try Harness(environment: environment, source: SyntheticSource())
+        harness.record(frames: 60)
+        // The segment thread lets go of its ring a moment after it reports the segment finished.
+        let deadline = Date().addingTimeInterval(2)
+        while MemoryLockBudget.shared.usedBytes != before && Date() < deadline { usleep(10_000) }
+        #expect(MemoryLockBudget.shared.usedBytes == before)
+    }
+
+    /// The settings from the first live recording, fed 8-bit UYVY as the card now delivers it for H.264.
+    @Test func eightBitCaptureRecordsH264FrameExact() throws {
+        var format = VideoFormat.hd1080p5994
+        format.pixelLayout = .uyvy422
+        let long = LongGOPSettings(encoder: .h264Hardware, rateControl: .constantQuality(value: 90, maximumKbps: 15_000))
+        let harness = try Harness(
+            environment: environment,
+            settings: InputRecorderSettings(codec: .longGOP(long), audio: AudioFormat(channels: 2), fullSyncSeconds: 0),
+            source: SyntheticSource(format: format, audioChannels: 2)
+        )
+        harness.record(frames: 180)
+
+        let segment = try #require(harness.segments.first)
+        #expect(segment.state == .finalized)
+        #expect(segment.format.pixelLayout == .uyvy422)
+        #expect(segment.repeatedFrames == 0)
+        let info = try harness.info(segment, environment: environment)
+        #expect(info.codecName == "h264")
+        #expect(info.width == 1920)
+        #expect(info.videoFrames == harness.indexRecords(segment).count)
+        let ringEvent = harness.session.store.snapshot.inputs.first?.events.first { $0.kind == "ring_memory" }
+        #expect(ringEvent?.detail?.hasPrefix("locked") == true)
+    }
+
     @Test func killedLongGOPRecorderLeavesARecoverableFile() throws {
         let settings = InputRecorderSettings(codec: .longGOP(.defaultSettings(for: .hevc)), fullSyncSeconds: 0)
         let harness = try Harness(environment: environment, settings: settings, source: SyntheticSource())
@@ -600,7 +663,7 @@ import Testing
         guard FileManager.default.fileExists(atPath: Self.appleDTD) else { return }
         let path = (exportDirectory as NSString).appendingPathComponent("test.fcpxml")
         let result = try ProcessRunner.run("/usr/bin/xmllint", ["--noout", "--dtdvalid", Self.appleDTD, path])
-        #expect(result.status == 0, "\(result.output)")
+        #expect(result.status == 0, "\(result.combinedOutput)")
     }
 
     @Test func controlServerServesCommandsAndRefusesBrowsers() async throws {

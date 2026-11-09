@@ -1081,3 +1081,157 @@ import Testing
         #expect(SessionReport(manifest: manifest(), health: [], timings: []).findings.first?.severity == .warning)
     }
 }
+
+@Suite struct CapturePixelLayoutTests {
+    @Test(arguments: [LongGOPEncoder.h264Hardware, .h264Software, .x264])
+    func h264CapturesEightBit(encoder: LongGOPEncoder) {
+        let codec = Codec.longGOP(LongGOPSettings(encoder: encoder, rateControl: .abr(kbps: 8_000)))
+        #expect(codec.sourcePixelLayout == .uyvy422)
+    }
+
+    @Test func tenBitCodecsKeepV210() {
+        var hevc422 = LongGOPSettings.defaultSettings(for: .hevc)
+        hevc422.chroma422 = true
+        let codecs: [Codec] = [
+            .proResProxy, .proResLT, .proRes422, .proResHQ, .proRes4444,
+            .longGOP(.defaultSettings(for: .hevc)),
+            .longGOP(hevc422),
+            .longGOP(LongGOPSettings(encoder: .x265, rateControl: .abr(kbps: 8_000))),
+        ]
+        for codec in codecs {
+            #expect(codec.sourcePixelLayout == .v210, "\(codec.displayName)")
+        }
+    }
+
+    @Test func eightBitFrameIsAQuarterSmaller() {
+        var format = VideoFormat.hd1080p5994
+        let tenBit = format.frameBytes
+        format.pixelLayout = .uyvy422
+        #expect(format.frameBytes == 4_147_200)
+        #expect(Double(format.frameBytes) / Double(tenBit) == 0.75)
+    }
+}
+
+@Suite struct FragmentedMovieTests {
+    func box(_ type: String, _ payload: Int) -> Data {
+        var data = Data()
+        let size = UInt32(8 + payload)
+        data.append(contentsOf: [UInt8(size >> 24), UInt8(size >> 16 & 0xFF), UInt8(size >> 8 & 0xFF), UInt8(size & 0xFF)])
+        data.append(contentsOf: Array(type.utf8))
+        data.append(Data(count: payload))
+        return data
+    }
+
+    func length(_ data: Data) -> Int64? {
+        FragmentedMovie.readableLength(fileSize: Int64(data.count)) { offset, count in
+            guard offset < data.count else { return nil }
+            return data.subdata(in: Int(offset)..<min(data.count, Int(offset) + count))
+        }
+    }
+
+    var header: Data { box("ftyp", 12) + box("moov", 100) }
+    var fragment: Data { box("moof", 40) + box("mdat", 1000) }
+
+    @Test func completeFileIsReadableToTheEnd() {
+        let file = header + fragment + fragment
+        #expect(length(file) == Int64(file.count))
+    }
+
+    @Test func cutInsideAFragmentHeaderDropsThatFragment() {
+        let clean = header + fragment
+        let file = clean + fragment.prefix(20)
+        #expect(length(file) == Int64(clean.count))
+    }
+
+    @Test func fragmentHeaderWithoutItsDataIsDropped() {
+        let clean = header + fragment
+        let file = clean + box("moof", 40)
+        #expect(length(file) == Int64(clean.count))
+    }
+
+    @Test func cutInsideMediaDataDropsThatFragment() {
+        let clean = header + fragment
+        let file = clean + fragment.prefix(500)
+        #expect(length(file) == Int64(clean.count))
+    }
+
+    @Test func noMovieMeansUnreadable() {
+        #expect(length(box("ftyp", 12) + Data(count: 50)) == nil)
+        #expect(length(Data(repeating: 0xFF, count: 64)) == nil)
+    }
+
+    @Test func largeSizeBoxesAreFollowed() {
+        var large = Data([0, 0, 0, 1]) + Data("mdat".utf8)
+        let size: UInt64 = 16 + 64
+        large.append(contentsOf: (0..<8).map { UInt8(size >> (56 - 8 * UInt64($0)) & 0xFF) })
+        large.append(Data(count: 64))
+        let file = header + box("moof", 40) + large
+        #expect(length(file) == Int64(file.count))
+    }
+}
+
+@Suite struct StallDetectorTests {
+    /// Samples every quarter second, as the recorder's monitor does.
+    func run(_ detector: inout StallDetector, from start: Double, to end: Double, output: (Double) -> Int64, input: (Double) -> Int, cpu: (Double) -> UInt64?, backlog: Bool = true) -> [StallDetector.Verdict] {
+        var verdicts: [StallDetector.Verdict] = []
+        var t = start
+        while t <= end {
+            verdicts.append(detector.observe(now: t, outputBytes: output(t), inputFrames: input(t), cpuNanos: cpu(t), backlog: backlog))
+            t += 0.25
+        }
+        return verdicts
+    }
+
+    @Test func workingRecorderStaysHealthy() {
+        var detector = StallDetector()
+        detector.reset(now: 0)
+        let verdicts = run(&detector, from: 0.25, to: 60, output: { Int64($0 * 1000) }, input: { Int($0 * 60) }, cpu: { UInt64($0 * 0.5e9) })
+        #expect(verdicts.allSatisfy { $0 == .healthy })
+    }
+
+    @Test func slowButAliveIsNeverKilledBeforeTheHardLimit() {
+        var detector = StallDetector()
+        detector.reset(now: 0)
+        // Output stops at 1 s, but ffmpeg keeps taking frames and using a third of a core.
+        let verdicts = run(&detector, from: 0.25, to: 29.75, output: { $0 < 1 ? Int64($0 * 1000) : 1000 }, input: { Int($0 * 60) }, cpu: { UInt64($0 * 0.33e9) })
+        #expect(!verdicts.contains(.hung))
+        #expect(verdicts.last == .slow)
+        // Output last grew at 1 s, so it is slow from just after 6 s. Sample i is at 0.25 + i * 0.25 s.
+        #expect(verdicts[Int((5.75 - 0.25) / 0.25)] == .healthy)
+        #expect(verdicts[Int((6.5 - 0.25) / 0.25)] == .slow)
+        #expect(detector.observe(now: 31.5, outputBytes: 1000, inputFrames: 2000, cpuNanos: UInt64(31.5 * 0.33e9), backlog: true) == .hung)
+    }
+
+    @Test func frozenRecorderIsHungAfterTheStallTime() {
+        var detector = StallDetector()
+        detector.reset(now: 0)
+        // Everything stops at 2 s, as with SIGSTOP.
+        let verdicts = run(&detector, from: 0.25, to: 13, output: { Int64(min($0, 2) * 1000) }, input: { Int(min($0, 2) * 60) }, cpu: { UInt64(min($0, 2) * 0.4e9) })
+        let firstHung = verdicts.firstIndex(of: .hung).map { 0.25 + Double($0) * 0.25 }
+        #expect(firstHung != nil && firstHung! > 12 && firstHung! <= 12.5)
+    }
+
+    @Test func idleCPUTicksDoNotCountAsWork() {
+        var detector = StallDetector()
+        detector.reset(now: 0)
+        // A blocked process still accrues a millisecond here and there.
+        let verdicts = run(&detector, from: 0.25, to: 11, output: { _ in 0 }, input: { _ in 0 }, cpu: { UInt64($0 * 0.002e9) })
+        #expect(verdicts.contains(.hung))
+    }
+
+    @Test func noBacklogIsNotAStall() {
+        var detector = StallDetector()
+        detector.reset(now: 0)
+        let verdicts = run(&detector, from: 0.25, to: 40, output: { _ in 0 }, input: { _ in 0 }, cpu: { _ in nil }, backlog: false)
+        #expect(verdicts.allSatisfy { $0 == .healthy })
+        // The clock starts when frames start waiting, not when output last grew.
+        #expect(detector.observe(now: 41, outputBytes: 0, inputFrames: 0, cpuNanos: nil, backlog: true) == .healthy)
+    }
+
+    @Test func unreadableCPUFallsBackToOutputAndInput() {
+        var detector = StallDetector()
+        detector.reset(now: 0)
+        let verdicts = run(&detector, from: 0.25, to: 11, output: { _ in 0 }, input: { _ in 0 }, cpu: { _ in nil })
+        #expect(verdicts.contains(.hung))
+    }
+}

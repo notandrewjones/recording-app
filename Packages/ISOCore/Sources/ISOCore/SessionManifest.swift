@@ -67,6 +67,8 @@ public struct SessionManifest: Codable, Hashable, Sendable {
         public var lostFrames: Int = 0
         public var state: SegmentState = .recording
         public var endReason: EndReason?
+        /// Why the last attempt to finalize failed. Nil once finalized, and in older manifests.
+        public var finalizeError: String?
 
         public init(number: Int, workingFile: String, finalFile: String, indexFile: String, logFile: String, format: VideoFormat, codec: Codec, audioChannels: Int, startTimecode: String, timecodeIsEmbedded: Bool, startHostNanos: UInt64, timecodeSource: TimecodeSource? = nil) {
             self.number = number

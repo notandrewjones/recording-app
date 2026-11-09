@@ -62,7 +62,13 @@ final class SegmentRecorder: @unchecked Sendable {
     }
 
     func start() {
-        let thread = Thread { [self] in run() }
+        let thread = Thread { [self] in
+            run()
+            // The owner's callbacks capture this recorder, so dropping them is what lets it and its ring go.
+            onOpened = nil
+            onConnected = nil
+            onFinished = nil
+        }
         thread.name = "segment-video-\(configuration.number)"
         thread.qualityOfService = .userInteractive
         thread.stackSize = 1 << 20

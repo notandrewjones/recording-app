@@ -29,6 +29,13 @@ public enum Codec: Hashable, Codable, Sendable {
     /// Every frame decodable on its own. Replay cueing and jog depend on this.
     public var isIntraOnly: Bool { isProRes }
 
+    /// What to ask the card for. H.264 here is always 8-bit 4:2:0, so 10-bit capture only costs memory and a
+    /// conversion. ProRes, every HEVC path and x265 encode 10-bit, so they keep v210.
+    public var sourcePixelLayout: PixelLayout {
+        if case .longGOP(let settings) = self, settings.encoder.family == .h264 { return .uyvy422 }
+        return .v210
+    }
+
     /// Apple's published target for 1920x1080 at 29.97, scaled by pixel rate for other formats.
     private var proResMegabitsAtHD2997: Double? {
         switch self {

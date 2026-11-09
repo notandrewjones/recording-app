@@ -40,22 +40,39 @@ public struct FFmpegEnvironment: Hashable, Sendable {
 enum ProcessRunner {
     struct Result {
         var status: Int32
+        /// Standard output only. Warnings must never be read as an answer: ffprobe's warning about a
+        /// cut-off last frame used to be parsed as the frame count, so most crashed segments failed to finalize.
         var output: String
+        var errorOutput: String
+        /// Both streams, for messages shown to a person.
+        var combinedOutput: String { errorOutput.isEmpty ? output : output + errorOutput }
     }
 
-    /// Runs a short-lived tool to completion, draining output as it arrives so a full pipe cannot wedge it.
+    /// Runs a short-lived tool to completion, draining both pipes as output arrives so neither can wedge it.
     static func run(_ path: String, _ arguments: [String]) throws -> Result {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = arguments
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
         process.standardInput = FileHandle.nullDevice
         try process.run()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        var errData = Data()
+        let errDone = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .utility).async {
+            errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            errDone.signal()
+        }
+        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+        errDone.wait()
         process.waitUntilExit()
-        return Result(status: process.terminationStatus, output: String(decoding: data, as: UTF8.self))
+        return Result(
+            status: process.terminationStatus,
+            output: String(decoding: outData, as: UTF8.self),
+            errorOutput: String(decoding: errData, as: UTF8.self)
+        )
     }
 }
 
@@ -71,12 +88,22 @@ public enum MediaProbe {
         public var fieldOrder: String
     }
 
+    public struct ProbeFailure: Error, CustomStringConvertible {
+        public var description: String
+    }
+
+    /// Throws `ProbeFailure` with ffprobe's own message when the file cannot be read or counted.
     public static func videoFrameCount(_ path: String, environment: FFmpegEnvironment) throws -> Int {
         let result = try ProcessRunner.run(environment.ffprobePath, [
             "-v", "error", "-count_packets", "-select_streams", "v",
             "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", path,
         ])
-        return Int(result.output.split(whereSeparator: { $0 == "," || $0.isNewline }).first ?? "") ?? 0
+        let token = result.output.split(whereSeparator: { $0 == "," || $0.isNewline }).first.map(String.init) ?? ""
+        guard result.status == 0, let count = Int(token.trimmingCharacters(in: .whitespaces)) else {
+            let message = result.errorOutput.split(whereSeparator: \.isNewline).last.map(String.init) ?? "no output"
+            throw ProbeFailure(description: "ffprobe exit \(result.status): \(message)")
+        }
+        return count
     }
 
     public static func info(_ path: String, environment: FFmpegEnvironment) throws -> Info {
