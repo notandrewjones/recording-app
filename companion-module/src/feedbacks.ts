@@ -8,9 +8,11 @@ export type FeedbacksSchema = {
 	recording: { type: 'boolean'; options: NoOptions }
 	finalizing: { type: 'boolean'; options: NoOptions }
 	disconnected: { type: 'boolean'; options: NoOptions }
+	not_recording: { type: 'boolean'; options: NoOptions }
 	input_armed: { type: 'boolean'; options: InputOptions }
 	input_recording: { type: 'boolean'; options: InputOptions }
 	input_signal: { type: 'boolean'; options: InputOptions }
+	input_not_recording: { type: 'boolean'; options: InputOptions }
 }
 
 export const Colors = {
@@ -61,6 +63,14 @@ export function UpdateFeedbacks(self: IsoRecorderInstance): void {
 			options: [],
 			callback: () => !self.connected,
 		},
+		not_recording: {
+			type: 'boolean',
+			name: 'An input is not recording',
+			description: 'A session is running, but an armed input has saved nothing for a few seconds.',
+			defaultStyle: { bgcolor: Colors.warning, color: Colors.black },
+			options: [],
+			callback: () => self.status?.inputs.some((input) => input.problem !== undefined) === true,
+		},
 		input_armed: {
 			type: 'boolean',
 			name: 'Input: armed',
@@ -84,6 +94,14 @@ export function UpdateFeedbacks(self: IsoRecorderInstance): void {
 			showInvert: true,
 			options: [inputOption],
 			callback: (feedback) => input(feedback.options)?.signal === true,
+		},
+		input_not_recording: {
+			type: 'boolean',
+			name: 'Input: not recording',
+			description: 'This input should be recording, but nothing is being saved for it. input_N_problem says why.',
+			defaultStyle: { bgcolor: Colors.warning, color: Colors.black },
+			options: [inputOption],
+			callback: (feedback) => input(feedback.options)?.problem !== undefined,
 		},
 	})
 }

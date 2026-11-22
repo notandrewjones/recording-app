@@ -42,8 +42,11 @@ public struct InputRecorderSettings: Sendable {
     public var allowSoftwareProRes: Bool
     /// Where each segment's starting timecode comes from. `InputRecorder.setTimecodeSource` changes it later.
     public var timecodeSource: TimecodeSource
+    /// Recording requested but no file written for this long raises `InputRecorderStatus.notWriting`.
+    /// Long enough to ride out a normal start or a quick restart.
+    public var notWritingAlarmSeconds: Double
 
-    public init(codec: Codec = .proResLT, audio: AudioFormat? = AudioFormat(channels: 16), ringSeconds: Double = 1, stallSeconds: Double = 10, signalTimeoutSeconds: Double = 1, fullSyncSeconds: Double = 2, allowSoftwareProRes: Bool = false, timecodeSource: TimecodeSource = .source, hardStallSeconds: Double = 30, slowSeconds: Double = 5) {
+    public init(codec: Codec = .proResLT, audio: AudioFormat? = AudioFormat(channels: 16), ringSeconds: Double = 1, stallSeconds: Double = 10, signalTimeoutSeconds: Double = 1, fullSyncSeconds: Double = 2, allowSoftwareProRes: Bool = false, timecodeSource: TimecodeSource = .source, hardStallSeconds: Double = 30, slowSeconds: Double = 5, notWritingAlarmSeconds: Double = 5) {
         self.codec = codec
         self.audio = audio
         self.ringSeconds = ringSeconds
@@ -54,6 +57,7 @@ public struct InputRecorderSettings: Sendable {
         self.fullSyncSeconds = fullSyncSeconds
         self.allowSoftwareProRes = allowSoftwareProRes
         self.timecodeSource = timecodeSource
+        self.notWritingAlarmSeconds = notWritingAlarmSeconds
     }
 }
 
@@ -71,6 +75,12 @@ public struct InputRecorderStatus: Sendable {
     /// Bytes written across every segment so far, for the session's write rate.
     public var bytesWritten: Int64
     public var ffmpegProcessIdentifier: Int32?
+    /// A file is being written. False while waiting for signal, starting, restarting or after giving up.
+    public var isWriting: Bool
+    /// Set once recording has been requested with no file written for `notWritingAlarmSeconds`.
+    public var notWriting: NotWritingReason?
+    /// Frames the capture source has handed over since this recorder was created, with or without signal.
+    public var framesReceived: Int
 }
 
 /// Supervises one input's recording. All decisions come from `RecorderWatchdog`; this class performs them.
@@ -97,6 +107,9 @@ public final class InputRecorder: @unchecked Sendable {
     private var gapDetector: FrameGapDetector?
     private var rolloverPending = false
     private var timecodeSource: TimecodeSource
+    /// Unlike `lastIngestUptime`, which the monitor resets, these only change when a frame really arrives.
+    private var lastFrameUptime: UInt64?
+    private var framesReceived = 0
 
     // Owned by `queue`.
     private var watchdog = RecorderWatchdog()
@@ -119,6 +132,12 @@ public final class InputRecorder: @unchecked Sendable {
     private var gapFrames = 0
     /// Set when a segment fails, so the next opening can measure what was lost in between.
     private var failedAtHostNanos: UInt64?
+    /// When recording was requested, or last stopped writing, while it is still requested. Nil while writing.
+    private var notWritingSinceUptime: UInt64?
+    /// Identifies the current not-writing stretch, so an alarm scheduled for an earlier one does nothing.
+    private var notWritingEpisode = 0
+    /// Whether this stretch has been logged as `not_writing`, so its end is logged too.
+    private var notWritingLogged = false
 
     init(id: String, label: String, settings: InputRecorderSettings, store: SessionStore, finalizer: Finalizer, environment: FFmpegEnvironment, socketDirectory: String, socketPrefix: String) {
         self.id = id
@@ -141,9 +160,15 @@ public final class InputRecorder: @unchecked Sendable {
     public func ingest(_ frame: IngestFrame) {
         let uptime = DispatchTime.now().uptimeNanoseconds
         var events: [RecorderWatchdog.Event] = []
+        var firstFrame: String?
 
         let target: FrameRing? = lock.withLock {
             lastIngestUptime = uptime
+            lastFrameUptime = uptime
+            framesReceived += 1
+            if framesReceived == 1 {
+                firstFrame = "\(frame.format.displayName) \(frame.format.pixelLayout.rawValue), \(frame.hasSignal ? "signal" : "no signal")"
+            }
             let previous = lastSignal
             lastSignal = frame.hasSignal
             guard frame.hasSignal else {
@@ -158,8 +183,11 @@ public final class InputRecorder: @unchecked Sendable {
             return ring
         }
 
-        if !events.isEmpty {
-            queue.async { [self] in events.forEach { send($0) } }
+        if firstFrame != nil || !events.isEmpty {
+            queue.async { [self] in
+                if let firstFrame { log("first_frame", detail: firstFrame) }
+                events.forEach { send($0) }
+            }
         }
         guard let target else { return }
 
@@ -230,6 +258,12 @@ public final class InputRecorder: @unchecked Sendable {
         queue.async { [self] in send(.signalLost) }
     }
 
+    /// Adds an event to this input in the session file, for what only the caller knows, such as the state
+    /// of the capture card.
+    public func note(_ kind: String, detail: String? = nil) {
+        queue.async { [self] in log(kind, detail: detail) }
+    }
+
     public func killRecorderForTesting() {
         queue.async { [self] in current?.kill() }
     }
@@ -242,6 +276,8 @@ public final class InputRecorder: @unchecked Sendable {
 
     public func status() -> InputRecorderStatus {
         queue.sync {
+            let now = DispatchTime.now().uptimeNanoseconds
+            let alarmed = notWritingSinceUptime.map { HostTime.seconds(from: $0, to: now) >= settings.notWritingAlarmSeconds } ?? false
             let live = current?.counters ?? (0, 0)
             let segment: Int?
             switch watchdog.state {
@@ -259,7 +295,10 @@ public final class InputRecorder: @unchecked Sendable {
                 peakRingFill: peakRingFill,
                 gapFrames: gapFrames,
                 bytesWritten: bytesWritten,
-                ffmpegProcessIdentifier: current?.processIdentifier
+                ffmpegProcessIdentifier: current?.processIdentifier,
+                isWriting: isWriting,
+                notWriting: alarmed ? notWritingReason(now: now) : nil,
+                framesReceived: lock.withLock { framesReceived }
             )
         }
     }
@@ -273,11 +312,51 @@ public final class InputRecorder: @unchecked Sendable {
         }
     }
 
+    private var isWriting: Bool {
+        if case .recording = watchdog.state { return true }
+        return false
+    }
+
     private func send(_ event: RecorderWatchdog.Event) {
         if event == .signalLost { closingReason = .signalLost; log("signal_lost") }
         if event == .signalRestored { log("signal_restored") }
         if event == .formatChanged, closingReason != .discontinuity { closingReason = .formatChanged }
         perform(watchdog.handle(event))
+        updateWritingState()
+    }
+
+    /// Times each stretch where recording is requested but no file is being written, and logs the ones
+    /// that last long enough to matter. Nothing else in the session file shows them: waiting for a first
+    /// frame that never comes leaves no segments and no other events.
+    private func updateWritingState() {
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard recordingRequested, !isWriting else {
+            if recordingRequested, notWritingLogged, let since = notWritingSinceUptime {
+                log("writing_resumed", detail: String(format: "after %.1f s", HostTime.seconds(from: since, to: now)))
+            }
+            notWritingSinceUptime = nil
+            notWritingLogged = false
+            return
+        }
+        guard notWritingSinceUptime == nil else { return }
+        notWritingSinceUptime = now
+        notWritingEpisode += 1
+        let episode = notWritingEpisode
+        queue.asyncAfter(deadline: .now() + settings.notWritingAlarmSeconds) { [self] in
+            guard episode == notWritingEpisode, notWritingSinceUptime != nil else { return }
+            notWritingLogged = true
+            log("not_writing", detail: notWritingReason(now: DispatchTime.now().uptimeNanoseconds).description)
+        }
+    }
+
+    private func notWritingReason(now: UInt64) -> NotWritingReason {
+        let (lastFrame, hasSignal) = lock.withLock { (lastFrameUptime, lastSignal == true) }
+        return NotWritingReason(
+            state: watchdog.state,
+            secondsSinceFrame: lastFrame.map { HostTime.seconds(from: $0, to: now) },
+            hasSignal: hasSignal,
+            frameTimeoutSeconds: settings.signalTimeoutSeconds
+        )
     }
 
     private func perform(_ actions: [RecorderWatchdog.Action]) {

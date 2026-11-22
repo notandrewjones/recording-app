@@ -294,6 +294,59 @@ import Testing
         #expect(harness.segments.first?.endReason == .signalLost)
     }
 
+    /// The 2026-11-15 failure: Record pressed, no frame ever arrives, nothing is written. It must be visible
+    /// in the status while it happens and in the session file afterwards.
+    @Test func noFramesAfterRecordRaisesNotWriting() throws {
+        let harness = try Harness(environment: environment, settings: InputRecorderSettings(fullSyncSeconds: 0, notWritingAlarmSeconds: 0.5), source: SyntheticSource())
+        harness.recorder.startRecording()
+        Thread.sleep(forTimeInterval: 0.2)
+        #expect(harness.recorder.status().notWriting == nil, "too early to raise")
+        Thread.sleep(forTimeInterval: 0.6)
+
+        let status = harness.recorder.status()
+        #expect(!status.isWriting)
+        #expect(status.notWriting == .noVideo)
+        #expect(status.framesReceived == 0)
+        harness.finish()
+
+        let events = harness.session.store.snapshot.inputs[0].events
+        #expect(events.map(\.kind) == ["not_writing"])
+        #expect(events.first?.detail == "no video from the capture card")
+        let report = try SessionAnalysis.report(directory: harness.session.layout.sessionDirectory)
+        #expect(!report.passed)
+        #expect(report.findings.contains { $0.message == "Cam: nothing was recorded. No video arrived from the capture card." })
+    }
+
+    @Test func lateFramesClearNotWritingAndAreLogged() throws {
+        let harness = try Harness(environment: environment, settings: InputRecorderSettings(fullSyncSeconds: 0, notWritingAlarmSeconds: 0.5), source: SyntheticSource())
+        harness.recorder.startRecording()
+        Thread.sleep(forTimeInterval: 0.8)
+        #expect(harness.recorder.status().notWriting == .noVideo)
+
+        harness.source.start(frames: 120)
+        harness.source.waitUntilFinished()
+        let status = harness.recorder.status()
+        #expect(status.isWriting)
+        #expect(status.notWriting == nil)
+        #expect(status.framesReceived == 120)
+        harness.finish()
+
+        let events = harness.session.store.snapshot.inputs[0].events
+        let kinds = events.map(\.kind)
+        #expect(kinds.contains("not_writing"))
+        #expect(kinds.contains("writing_resumed"))
+        #expect(events.first { $0.kind == "first_frame" }?.detail == "1080p59.94 v210, signal")
+        #expect(harness.segments.count == 1)
+    }
+
+    @Test func normalStartIsNotFlagged() throws {
+        let harness = try Harness(environment: environment, settings: InputRecorderSettings(fullSyncSeconds: 0, notWritingAlarmSeconds: 2), source: SyntheticSource())
+        harness.record(frames: 180)
+        let kinds = harness.session.store.snapshot.inputs[0].events.map(\.kind)
+        #expect(kinds.contains("first_frame"))
+        #expect(!kinds.contains("not_writing"))
+    }
+
     @Test func killedFFmpegRestartsIntoANewSegment() throws {
         let harness = try Harness(environment: environment, source: SyntheticSource())
         harness.source.start(frames: 360)

@@ -6,6 +6,27 @@
 #include <mutex>
 #include <time.h>
 
+/// Counts from the SDK's threads, read from any thread. Owned by `DLInput`, so it outlives each callback.
+struct DLCaptureStats {
+    std::atomic<uint64_t> frameCallbacks{0};
+    std::atomic<uint64_t> unreadableFrames{0};
+    std::atomic<uint64_t> formatChanges{0};
+    std::mutex lastChangeLock;
+    DLFormat lastFormat{};
+    BMDVideoInputFormatChangedEvents lastEvents = 0;
+    BMDDetectedVideoInputFormatFlags lastFlags = 0;
+
+    void reset() {
+        frameCallbacks = 0;
+        unreadableFrames = 0;
+        formatChanges = 0;
+        std::lock_guard<std::mutex> guard(lastChangeLock);
+        lastFormat = DLFormat{};
+        lastEvents = 0;
+        lastFlags = 0;
+    }
+};
+
 static NSError *DLError(NSString *message, HRESULT result) {
     return [NSError errorWithDomain:@"DeckLinkBridge" code:result userInfo:@{NSLocalizedDescriptionKey: message}];
 }
@@ -30,8 +51,8 @@ static DLFormat DLFormatFromMode(IDeckLinkDisplayMode *mode) {
 
 class DLInputCallback final : public IDeckLinkInputCallback {
 public:
-    DLInputCallback(IDeckLinkInput *input, BMDPixelFormat pixelFormat, DLFrameHandler frameHandler, DLFormatHandler formatHandler)
-        : input_(input), pixelFormat_(pixelFormat), frameHandler_(frameHandler), formatHandler_(formatHandler) {}
+    DLInputCallback(IDeckLinkInput *input, BMDPixelFormat pixelFormat, DLCaptureStats *stats, DLFrameHandler frameHandler, DLFormatHandler formatHandler)
+        : input_(input), pixelFormat_(pixelFormat), stats_(stats), frameHandler_(frameHandler), formatHandler_(formatHandler) {}
 
     HRESULT QueryInterface(REFIID, LPVOID *ppv) override {
         *ppv = nullptr;
@@ -44,7 +65,14 @@ public:
         return count;
     }
 
-    HRESULT VideoInputFormatChanged(BMDVideoInputFormatChangedEvents, IDeckLinkDisplayMode *mode, BMDDetectedVideoInputFormatFlags) override {
+    HRESULT VideoInputFormatChanged(BMDVideoInputFormatChangedEvents events, IDeckLinkDisplayMode *mode, BMDDetectedVideoInputFormatFlags flags) override {
+        stats_->formatChanges++;
+        {
+            std::lock_guard<std::mutex> guard(stats_->lastChangeLock);
+            stats_->lastFormat = DLFormatFromMode(mode);
+            stats_->lastEvents = events;
+            stats_->lastFlags = flags;
+        }
         input_->PauseStreams();
         input_->EnableVideoInput(mode->GetDisplayMode(), pixelFormat_, bmdVideoInputEnableFormatDetection);
         input_->FlushStreams();
@@ -56,13 +84,19 @@ public:
     HRESULT VideoInputFrameArrived(IDeckLinkVideoInputFrame *frame, IDeckLinkAudioInputPacket *audio) override {
         if (frame == nullptr) return S_OK;
         const uint64_t hostTime = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        stats_->frameCallbacks++;
 
         IDeckLinkVideoBuffer *buffer = nullptr;
-        if (frame->QueryInterface(IID_IDeckLinkVideoBuffer, (void **)&buffer) != S_OK) return S_OK;
+        if (frame->QueryInterface(IID_IDeckLinkVideoBuffer, (void **)&buffer) != S_OK) {
+            stats_->unreadableFrames++;
+            return S_OK;
+        }
 
         void *videoBytes = nullptr;
+        bool delivered = false;
         if (buffer->StartAccess(bmdBufferAccessRead) == S_OK) {
             if (buffer->GetBytes(&videoBytes) == S_OK && videoBytes != nullptr) {
+                delivered = true;
                 DLFrameInfo info{};
                 info.rowBytes = (int32_t)frame->GetRowBytes();
                 info.width = (int32_t)frame->GetWidth();
@@ -85,6 +119,7 @@ public:
             }
             buffer->EndAccess(bmdBufferAccessRead);
         }
+        if (!delivered) stats_->unreadableFrames++;
         buffer->Release();
         return S_OK;
     }
@@ -103,6 +138,7 @@ private:
     std::atomic<ULONG> refCount_{1};
     IDeckLinkInput *input_;
     const BMDPixelFormat pixelFormat_;
+    DLCaptureStats *stats_;
     DLFrameHandler frameHandler_;
     DLFormatHandler formatHandler_;
 };
@@ -111,6 +147,7 @@ private:
     IDeckLink *_deckLink;
     IDeckLinkInput *_input;
     DLInputCallback *_callback;
+    DLCaptureStats *_stats;
 }
 
 - (nullable instancetype)initWithDeckLink:(IDeckLink *)deckLink {
@@ -151,6 +188,7 @@ private:
     attributes->GetFlag(BMDDeckLinkSupportsInputFormatDetection, &detection);
     _supportsFormatDetection = detection;
     _captureTenBit = YES;
+    _stats = new DLCaptureStats();
 
     // Sub-devices of one card can share a persistent ID, so the sub-device index is part of identity.
     int64_t persistentID = 0;
@@ -169,6 +207,41 @@ private:
     [self stop];
     if (_input) _input->Release();
     if (_deckLink) _deckLink->Release();
+    delete _stats;
+}
+
+- (NSString *)captureStatsDescription {
+    const uint64_t callbacks = _stats->frameCallbacks;
+    const uint64_t unreadable = _stats->unreadableFrames;
+    const uint64_t changes = _stats->formatChanges;
+    NSMutableString *text = [NSMutableString stringWithFormat:@"%llu frame callbacks, %llu unreadable, %llu format change%@",
+        callbacks, unreadable, changes, changes == 1 ? @"" : @"s"];
+    if (changes == 0) return text;
+
+    DLFormat format;
+    BMDVideoInputFormatChangedEvents events;
+    BMDDetectedVideoInputFormatFlags flags;
+    {
+        std::lock_guard<std::mutex> guard(_stats->lastChangeLock);
+        format = _stats->lastFormat;
+        events = _stats->lastEvents;
+        flags = _stats->lastFlags;
+    }
+    NSMutableArray<NSString *> *what = [NSMutableArray array];
+    if (events & bmdVideoInputDisplayModeChanged) [what addObject:@"mode changed"];
+    if (events & bmdVideoInputFieldDominanceChanged) [what addObject:@"field dominance changed"];
+    if (events & bmdVideoInputColorspaceChanged) [what addObject:@"colorspace changed"];
+    NSMutableArray<NSString *> *detected = [NSMutableArray array];
+    if (flags & bmdDetectedVideoInputYCbCr422) [detected addObject:@"YCbCr 4:2:2"];
+    if (flags & bmdDetectedVideoInputRGB444) [detected addObject:@"RGB 4:4:4"];
+    if (flags & bmdDetectedVideoInput8BitDepth) [detected addObject:@"8-bit"];
+    if (flags & bmdDetectedVideoInput10BitDepth) [detected addObject:@"10-bit"];
+    if (flags & bmdDetectedVideoInput12BitDepth) [detected addObject:@"12-bit"];
+    const double rate = format.frameDuration > 0 ? (double)format.timeScale / (double)format.frameDuration : 0;
+    const BOOL interlaced = format.scan == DLScanModeInterlacedTopFirst || format.scan == DLScanModeInterlacedBottomFirst;
+    [text appendFormat:@" (last: %dx%d at %.2f%@; %@; %@)", format.width, format.height, rate, interlaced ? @" interlaced" : @"",
+        what.count ? [what componentsJoinedByString:@", "] : @"no events", detected.count ? [detected componentsJoinedByString:@" "] : @"nothing detected"];
+    return text;
 }
 
 - (IDeckLink *)deckLink {
@@ -180,6 +253,7 @@ private:
                  formatHandler:(DLFormatHandler)formatHandler
                          error:(NSError **)error {
     [self stop];
+    _stats->reset();
 
     const BMDDisplayMode initialMode = bmdModeHD1080p5994;
     BMDVideoInputFlags flags = _supportsFormatDetection ? bmdVideoInputEnableFormatDetection : bmdVideoInputFlagDefault;
@@ -199,7 +273,7 @@ private:
         }
     }
 
-    _callback = new DLInputCallback(_input, pixelFormat, frameHandler, formatHandler);
+    _callback = new DLInputCallback(_input, pixelFormat, _stats, frameHandler, formatHandler);
     _input->SetCallback(_callback);
     result = _input->StartStreams();
     if (result != S_OK) {

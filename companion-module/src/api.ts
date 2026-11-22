@@ -8,9 +8,12 @@ export interface RecorderInput {
 	label: string
 	device: string
 	armed: boolean
+	/** A file is being written for this input now. Apps before API 3 also said so while it waited for signal. */
 	recording: boolean
 	signal: boolean
 	format?: string
+	/** Why an input that should be recording has written nothing for a few seconds. API 3 and later. */
+	problem?: string
 }
 
 export interface RecorderStatus {
@@ -126,6 +129,7 @@ export function parseStatus(json: unknown): RecorderStatus {
 			recording: input['recording'] === true,
 			signal: input['signal'] === true,
 			format: typeof input['format'] === 'string' ? input['format'] : undefined,
+			problem: typeof input['problem'] === 'string' && input['problem'] ? input['problem'] : undefined,
 		}
 	})
 	return {

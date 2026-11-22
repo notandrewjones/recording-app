@@ -1,7 +1,7 @@
 import type { RecorderInput, RecorderStatus } from './api.js'
 
 /** Per-input variables, named by position so a button can say "Input 2" without knowing the hardware ID. */
-export const InputVariableFields = ['name', 'armed', 'recording', 'signal', 'format'] as const
+export const InputVariableFields = ['name', 'armed', 'recording', 'signal', 'format', 'problem'] as const
 export type InputVariableField = (typeof InputVariableFields)[number]
 export type InputVariableId = `input_${number}_${InputVariableField}`
 
@@ -46,6 +46,7 @@ export function variableValues(status: RecorderStatus | undefined, connected: bo
 		values[`input_${input.index}_recording`] = input.recording
 		values[`input_${input.index}_signal`] = input.signal
 		values[`input_${input.index}_format`] = input.format ?? ''
+		values[`input_${input.index}_problem`] = input.problem ?? ''
 	}
 	return values
 }

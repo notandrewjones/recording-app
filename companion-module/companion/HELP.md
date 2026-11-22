@@ -31,7 +31,10 @@ order changes. An unplugged input stays selectable and is marked "(disconnected)
 ### Feedbacks
 
 - **Recording**, **Saving** (files still being finished after a stop)
-- **Input: armed**, **Input: recording** (tally), **Input: has signal** (invert it to flag a lost camera)
+- **Input: armed**, **Input: recording** (tally: a file is being written), **Input: has signal** (invert it
+  to flag a lost camera)
+- **An input is not recording**, **Input: not recording**: a session is running but an armed input has saved
+  nothing for a few seconds, for example because no video is reaching the capture card
 - **Connection lost**: ISO Recorder isn't answering. Put this last on a button so it dims instead of
   showing stale tally.
 
@@ -39,12 +42,15 @@ order changes. An unplugged input stays selectable and is marked "(disconnected)
 
 `recording`, `finalizing`, `record_time` (HH:MM:SS), `free_space`, `connected`, `input_count`, `armed_count`,
 and for each input by its position in the multiview: `input_N_name`, `input_N_armed`, `input_N_recording`,
-`input_N_signal`, `input_N_format`.
+`input_N_signal`, `input_N_format`, `input_N_problem` (empty unless the input should be recording and isn't).
+With older ISO Recorder versions (control API before 3), `input_N_recording` is also true while an input waits
+for signal, and `input_N_problem` stays empty.
 
 ### Presets
 
 **Record / Stop** shows the running time. There is one arm button per input, which is dim red when armed,
-bright red when recording, and has amber text when the input has no signal.
+bright red when recording, has amber text when the input has no signal, and turns amber when it should be
+recording but nothing is being saved. **Record / Stop** turns amber too while any input is not recording.
 
 ### Troubleshooting
 

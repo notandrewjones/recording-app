@@ -165,9 +165,21 @@ struct MultiviewScreen: View {
 
     private static let spacing: CGFloat = 6
 
+    static func notRecordingText(_ inputs: [NotRecordingInput]) -> String {
+        if inputs.count == 1, let input = inputs.first {
+            return "\(input.name) is not recording: \(input.reason.description). Nothing is being saved for it."
+        }
+        let list = inputs.map { "\($0.name) (\($0.reason.description))" }.joined(separator: ", ")
+        return "\(inputs.count) inputs are not recording: \(list). Nothing is being saved for them."
+    }
+
     /// Problems that stop or threaten a recording, most serious first.
     private var notices: [Notice] {
         var notices: [Notice] = []
+        if !model.notRecording.isEmpty {
+            // Not dismissible: it goes when the inputs record again, or are disarmed.
+            notices.append(Notice(id: "not-recording", severity: .failure, text: Self.notRecordingText(model.notRecording)))
+        }
         if let failure = model.recordingFailure {
             notices.append(Notice(
                 id: "failure",
@@ -518,14 +530,14 @@ struct InputTileView: View {
             Picker("Timecode", selection: timecodeSelection) {
                 ForEach(TimecodeSource.allCases) { Text($0.displayName).tag($0) }
             }
-            .disabled(tile.isRecording)
+            .disabled(tile.isInSession)
         }
         .alert("Rename \(tile.source.input.displayName)", isPresented: $isRenaming) {
             TextField(tile.source.input.displayName, text: $draftName)
             Button("Rename") { rename(draftName) }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text(tile.isRecording
+            Text(tile.isInSession
                 ? "Files already recording keep their current name. Leave empty to use the device name."
                 : "Recordings are named after the input. Leave empty to use the device name.")
         }
@@ -541,26 +553,31 @@ struct InputTileView: View {
     }
 
     private var armButtonLabel: String {
-        if tile.isRecording { return "Stop Recording \(tile.name)…" }
+        if tile.isInSession { return "Stop Recording \(tile.name)…" }
         if sessionActive { return tile.isArmed ? "Disarm \(tile.name)" : "Record \(tile.name)" }
         return tile.isArmed ? "Disarm \(tile.name)" : "Arm \(tile.name)"
     }
 
     private var stateDescription: String {
-        if tile.isRecording { return "recording" }
+        if tile.isWriting { return "recording" }
+        if let reason = tile.notWriting { return "not recording, \(reason.description)" }
+        if tile.isInSession { return "starting" }
         if !tile.isArmed { return sessionActive ? "not recording" : "not armed" }
         return "armed"
     }
 
-    /// Red while recording, amber while a session runs without this input, otherwise a hairline.
+    /// Red only while a file is being written. Amber while a session runs and nothing is saved for this
+    /// input, whether it was disarmed or is failing. Otherwise a hairline.
     private var borderColor: Color {
-        if tile.isRecording { return Palette.tally }
-        if sessionActive, !tile.isArmed { return Palette.warning }
+        if tile.isWriting { return Palette.tally }
+        if sessionActive, !tile.isArmed || tile.notWriting != nil { return Palette.warning }
         return Palette.line
     }
 
     private var overlayMessage: String? {
         if let error = tile.errorMessage { return error }
+        // Before the signal states: a card that stops sending leaves its last picture and "locked" behind.
+        if let reason = tile.notWriting { return "NOT RECORDING: \(reason.description.uppercased())" }
         switch tile.status.signal {
         case .noSignal: return "NO SIGNAL"
         case .unknown: return "WAITING FOR INPUT"
@@ -589,9 +606,13 @@ struct InputTileView: View {
                 .lineLimit(1)
                 .onTapGesture(count: 2, perform: beginRename)
                 .help(tile.name == tile.source.input.displayName ? "Double-click to rename" : "\(tile.source.input.displayName). Double-click to rename.")
-            // Armed is the normal state, so only the exceptions are labelled.
-            if tile.isRecording {
+            // Armed is the normal state, so only the exceptions are labelled. REC means a file is being written.
+            if tile.isWriting {
                 StateChip(text: "REC", foreground: .white, fill: Palette.tally)
+            } else if tile.notWriting != nil {
+                StateChip(text: "NOT RECORDING", foreground: .black, fill: Palette.warning)
+            } else if tile.isInSession {
+                StateChip(text: "STARTING", foreground: Palette.primaryText, fill: Palette.control, stroke: Palette.secondary)
             } else if !tile.isArmed {
                 if sessionActive {
                     StateChip(text: "NOT RECORDING", foreground: .black, fill: Palette.warning)
@@ -607,7 +628,7 @@ struct InputTileView: View {
                     .fixedSize()
             }
             TimecodeMenu(tile: tile, selection: timecodeSelection)
-            ArmButton(isArmed: tile.isArmed, isRecording: tile.isRecording, label: armButtonLabel, action: toggleArmed)
+            ArmButton(isArmed: tile.isArmed, isRecording: tile.isInSession, label: armButtonLabel, action: toggleArmed)
         }
     }
 
@@ -617,7 +638,7 @@ struct InputTileView: View {
                 .font(.system(size: 12, design: .monospaced))
                 .fixedSize()
             Spacer(minLength: 8)
-            if let recorder = tile.recorderStatus, tile.isRecording {
+            if let recorder = tile.recorderStatus, tile.isInSession {
                 LoadBar(fill: recorder.ringFill)
                 Text(recorderSummary(recorder))
                     .lineLimit(1)
@@ -639,7 +660,7 @@ private struct TimecodeMenu: View {
 
     private var help: String {
         let current = "Timecode: \(tile.timecodeSource.displayName)."
-        return tile.isRecording ? "\(current) Change it when this input is not recording." : current
+        return tile.isInSession ? "\(current) Change it when this input is not recording." : current
     }
 
     var body: some View {
@@ -660,7 +681,7 @@ private struct TimecodeMenu: View {
         .frame(minHeight: 20)
         .background(RoundedRectangle(cornerRadius: 4).fill(Palette.control))
         .overlay(RoundedRectangle(cornerRadius: 4).stroke(Palette.line))
-        .disabled(tile.isRecording)
+        .disabled(tile.isInSession)
         .help(help)
         .accessibilityLabel("Timecode for \(tile.name)")
         .accessibilityValue(tile.timecodeSource.displayName)

@@ -49,6 +49,11 @@ typedef void (^DLFormatHandler)(DLFormat format);
 @property (nonatomic, readonly) BOOL supportsFormatDetection;
 /// v210 when YES (the default), 8-bit UYVY when NO. Takes effect at the next start.
 @property (nonatomic) BOOL captureTenBit;
+/// What the card has done since capture last started, in one line for a session file, such as
+/// "3600 frame callbacks, 0 unreadable, 1 format change (last: 1920x1080 at 59.94 interlaced; mode changed; YCbCr 4:2:2 10-bit)".
+/// It covers frames that never reach the frame handler, which is the only way to tell a silent card from one
+/// whose frames are being dropped.
+@property (nonatomic, readonly) NSString *captureStatsDescription;
 
 /// Captures in the pixel format `captureTenBit` selects. With format detection the input follows the signal;
 /// otherwise it stays at 1080p59.94.

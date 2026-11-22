@@ -66,6 +66,13 @@ describe('variableValues', () => {
 		})
 	})
 
+	it('gives each input a problem variable that is empty while it records', () => {
+		const failing = { ...status, inputs: [{ ...wide, recording: false, problem: 'no signal' }, close] }
+		const values = variableValues(failing, true)
+		expect(values.input_1_problem).toBe('no signal')
+		expect(values.input_2_problem).toBe('')
+	})
+
 	it('keeps the last status while reporting the connection as lost', () => {
 		const values = variableValues(status, false)
 		expect(values.connected).toBe(false)

@@ -10,6 +10,7 @@ const InputFieldNames: Record<InputVariableField, string> = {
 	recording: 'recording',
 	signal: 'has signal',
 	format: 'video format',
+	problem: 'reason it is not recording',
 }
 
 export function UpdateVariableDefinitions(self: IsoRecorderInstance): void {

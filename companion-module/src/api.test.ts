@@ -153,6 +153,23 @@ describe('parseStatus', () => {
 		])
 	})
 
+	it('reads why an input is not recording, and treats an empty reason as none', () => {
+		const parsed = parseStatus({
+			apiVersion: 3,
+			recording: true,
+			inputs: [
+				{ id: 'a', recording: false, problem: 'no video from the capture card' },
+				{ id: 'b', recording: true, problem: '' },
+				{ id: 'c', recording: true, problem: 7 },
+			],
+		})
+		expect(parsed.inputs.map((input) => input.problem)).toEqual([
+			'no video from the capture card',
+			undefined,
+			undefined,
+		])
+	})
+
 	it('drops inputs without an ID and ignores wrongly typed fields', () => {
 		const parsed = parseStatus({ recording: 'yes', inputs: [{ label: 'no id' }, { id: 'x', armed: 'true' }] })
 		expect(parsed.recording).toBe(false)

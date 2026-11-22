@@ -20,6 +20,7 @@ export function UpdatePresets(self: IsoRecorderInstance): void {
 		steps: [{ down: [{ actionId: 'record_toggle', options: {} }], up: [] }],
 		feedbacks: [
 			{ feedbackId: 'recording', options: {}, style: { bgcolor: Colors.tally, color: Colors.white } },
+			{ feedbackId: 'not_recording', options: {}, style: { bgcolor: Colors.warning, color: Colors.black } },
 			{ feedbackId: 'finalizing', options: {}, style: { bgcolor: Colors.saving, color: Colors.white, text: 'SAVING' } },
 			{ feedbackId: 'disconnected', options: {}, style: { bgcolor: Colors.black, color: Colors.offline } },
 		],
@@ -48,6 +49,7 @@ export function UpdatePresets(self: IsoRecorderInstance): void {
 				{ feedbackId: 'input_armed', options, style: { bgcolor: Colors.armed, color: Colors.white } },
 				{ feedbackId: 'input_recording', options, style: { bgcolor: Colors.tally, color: Colors.white } },
 				{ feedbackId: 'input_signal', options, isInverted: true, style: { color: Colors.warning } },
+				{ feedbackId: 'input_not_recording', options, style: { bgcolor: Colors.warning, color: Colors.black } },
 				{ feedbackId: 'disconnected', options: {}, style: { bgcolor: Colors.black, color: Colors.offline } },
 			],
 		}
@@ -63,7 +65,7 @@ export function UpdatePresets(self: IsoRecorderInstance): void {
 			id: 'inputs',
 			name: 'Inputs',
 			description: inputPresetIds.length
-				? 'Arm or disarm an input. During a recording this punches it in or out. Dim red is armed, bright red is recording, and amber text means no signal.'
+				? 'Arm or disarm an input. During a recording this punches it in or out. Dim red is armed, bright red is recording, amber text means no signal, and amber fill means it should be recording but nothing is being saved.'
 				: 'Connect to ISO Recorder to get a button for each input.',
 			definitions: inputPresetIds,
 		},

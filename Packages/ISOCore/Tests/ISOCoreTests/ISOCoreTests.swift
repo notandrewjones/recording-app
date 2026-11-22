@@ -1080,6 +1080,62 @@ import Testing
     @Test func missingHealthIsNoted() {
         #expect(SessionReport(manifest: manifest(), health: [], timings: []).findings.first?.severity == .warning)
     }
+
+    func emptyManifest(events: [SessionManifest.Event] = []) -> SessionManifest {
+        var manifest = SessionManifest(name: "Sunday", createdAt: Date(timeIntervalSince1970: 0), createdAtHostNanos: 0)
+        var input = SessionManifest.InputRecord(id: "a", label: "Program")
+        input.events = events
+        manifest.inputs = [input]
+        return manifest
+    }
+
+    /// The 2026-11-15 session: hours of health samples, no segments, no events, and the report passed.
+    @Test func sessionWithNothingRecordedFails() {
+        let report = SessionReport(manifest: emptyManifest(), health: steadyHealth(), timings: [])
+        #expect(!report.passed)
+        #expect(report.findings.first?.message == "Nothing was recorded in this session.")
+        #expect(report.findings.contains { $0.message == "Program: nothing was recorded. No video arrived from the capture card." })
+    }
+
+    @Test func nothingRecordedSaysWhyWhenTheSessionFileKnows() {
+        func why(_ kinds: [(String, String?)]) -> String {
+            SessionReport.whyNothingRecorded(emptyManifest(events: kinds.map { .init(hostNanos: 0, kind: $0.0, detail: $0.1) }).inputs[0])
+        }
+        #expect(why([("capture_error", "Could not enable video input.")]) == "Capture failed: Could not enable video input.")
+        #expect(why([("first_frame", "1080p59.94 uyvy422, no signal"), ("signal_lost", nil)]) == "The input never had a signal.")
+        #expect(why([("signal_restored", nil), ("not_writing", "the recorder gave up (ffmpeg exited with code 1)")])
+            == "Not writing: the recorder gave up (ffmpeg exited with code 1).")
+    }
+
+    @Test func stretchesWithoutWritingWarn() {
+        var manifest = manifest()
+        manifest.inputs[0].events = [.init(hostNanos: 0, kind: "not_writing", detail: "no signal"), .init(hostNanos: 1, kind: "writing_resumed", detail: "after 12.0 s")]
+        let report = SessionReport(manifest: manifest, health: steadyHealth(), timings: [])
+        #expect(report.passed)
+        #expect(report.findings.map(\.message) == ["Cam 1: stopped writing 1 times while it should have been recording. First reason: no signal."])
+    }
+}
+
+@Suite struct NotWritingReasonTests {
+    @Test func noFrameEverIsNoVideo() {
+        #expect(NotWritingReason(state: .waitingForSignal(nextSegment: 1), secondsSinceFrame: nil, hasSignal: false, frameTimeoutSeconds: 1) == .noVideo)
+    }
+
+    @Test func framesThatStoppedAreNoVideo() {
+        #expect(NotWritingReason(state: .waitingForSignal(nextSegment: 2), secondsSinceFrame: 3, hasSignal: false, frameTimeoutSeconds: 1) == .noVideo)
+    }
+
+    @Test func framesWithoutSignalAreNoSignal() {
+        #expect(NotWritingReason(state: .waitingForSignal(nextSegment: 1), secondsSinceFrame: 0.02, hasSignal: false, frameTimeoutSeconds: 1) == .noSignal)
+    }
+
+    @Test func liveSignalWithoutAFileIsARestart() {
+        #expect(NotWritingReason(state: .backingOff(nextSegment: 3, attempt: 2), secondsSinceFrame: 0.02, hasSignal: true, frameTimeoutSeconds: 1) == .restarting)
+    }
+
+    @Test func givingUpWinsOverEverythingElse() {
+        #expect(NotWritingReason(state: .failed(reason: "output stalled"), secondsSinceFrame: 0.02, hasSignal: true, frameTimeoutSeconds: 1) == .failed("output stalled"))
+    }
 }
 
 @Suite struct CapturePixelLayoutTests {

@@ -114,6 +114,9 @@ public struct SessionReport: Sendable {
         summary.append("Inputs: \(manifest.inputs.count), segments: \(segments.count), frames: \(segments.map(\.frames).reduce(0, +))")
         summary.append(String(format: "Health samples: %d over %@", health.count, duration.durationDescription))
 
+        if !manifest.inputs.isEmpty, manifest.inputs.allSatisfy(\.segments.isEmpty) {
+            findings.append(Finding(severity: .failure, message: "Nothing was recorded in this session."))
+        }
         for input in manifest.inputs {
             checkInput(input)
         }
@@ -135,7 +138,18 @@ public struct SessionReport: Sendable {
         let slow = input.events.filter { $0.kind == "output_slow" }.count
         let unlocked = input.events.filter { $0.kind == "ring_memory" && $0.detail?.hasPrefix("locked") == false }.count
         let finalizeReason = input.segments.compactMap(\.finalizeError).first
+        let captureError = input.events.first { $0.kind == "capture_error" }?.detail
+        let notWriting = input.events.filter { $0.kind == "not_writing" }
 
+        if input.segments.isEmpty {
+            findings.append(Finding(severity: .failure, message: "\(input.label): nothing was recorded. \(Self.whyNothingRecorded(input))"))
+        } else {
+            if let captureError { findings.append(Finding(severity: .warning, message: "\(input.label): capture failed at some point: \(captureError)")) }
+            if !notWriting.isEmpty {
+                let first = notWriting[0].detail.map { " First reason: \($0)." } ?? ""
+                findings.append(Finding(severity: .warning, message: "\(input.label): stopped writing \(notWriting.count) times while it should have been recording.\(first)"))
+            }
+        }
         if repeated > 0 { findings.append(Finding(severity: .failure, message: "\(input.label): \(repeated) repeated frames.")) }
         if lost > 0 { findings.append(Finding(severity: .failure, message: "\(input.label): \(lost) frames lost in a crash.")) }
         if failures > 0 { findings.append(Finding(severity: .failure, message: "\(input.label): recorder failed \(failures) times.")) }
@@ -146,6 +160,25 @@ public struct SessionReport: Sendable {
         if slow > 0 { findings.append(Finding(severity: .warning, message: "\(input.label): ffmpeg fell behind \(slow) times.")) }
         if unlocked > 0 { findings.append(Finding(severity: .warning, message: "\(input.label): frame ring could not be locked in memory.")) }
         if signal > 0 { findings.append(Finding(severity: .warning, message: "\(input.label): signal lost \(signal) times.")) }
+    }
+
+    /// The best explanation the session file holds. Older sessions only have the signal events, which are
+    /// logged on an input's first frame, so having none of them still means no frame ever arrived.
+    static func whyNothingRecorded(_ input: SessionManifest.InputRecord) -> String {
+        let kinds = Set(input.events.map(\.kind))
+        if let error = input.events.first(where: { $0.kind == "capture_error" })?.detail {
+            return "Capture failed: \(error)"
+        }
+        if kinds.isDisjoint(with: ["first_frame", "signal_lost", "signal_restored"]) {
+            return "No video arrived from the capture card."
+        }
+        if !kinds.contains("signal_restored") {
+            return "The input never had a signal."
+        }
+        if let reason = input.events.first(where: { $0.kind == "not_writing" })?.detail {
+            return "Not writing: \(reason)."
+        }
+        return "Recording was too short to keep any frames."
     }
 
     private mutating func checkHealth(_ health: [HealthSample]) {

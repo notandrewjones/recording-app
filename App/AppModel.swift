@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import ISOCore
 import ISOEngine
@@ -8,6 +9,13 @@ struct MarkerNote: Equatable, Identifiable {
     let number: Int
     let label: String
     let elapsed: TimeInterval
+}
+
+/// An input that should be recording but has written nothing for a few seconds.
+struct NotRecordingInput: Equatable, Identifiable {
+    let id: String
+    let name: String
+    let reason: NotWritingReason
 }
 
 /// A reason recording isn't running, and the settings tab that fixes it, if any.
@@ -61,12 +69,21 @@ final class InputTile: ObservableObject, Identifiable {
         }
     }
 
-    var isRecording: Bool {
+    /// Armed into the running session: writing a file, or waiting or retrying to. Settings a file keeps
+    /// are locked while this is true. It does not mean anything is being saved; `isWriting` does.
+    var isInSession: Bool {
         switch recorderStatus?.state {
         case .recording, .starting, .waitingForSignal, .backingOff: true
         default: false
         }
     }
+
+    /// A file is being written now. Only this earns the REC tally.
+    var isWriting: Bool { recorderStatus?.isWriting ?? false }
+
+    /// Why this input should be recording but has written nothing for a few seconds, including after
+    /// its recorder gave up.
+    var notWriting: NotWritingReason? { recorderStatus?.notWriting }
 }
 
 @MainActor
@@ -106,6 +123,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var failedStartCount = 0
     /// An input waiting for the operator to confirm stopping it mid-session.
     @Published var pendingPunchOut: InputTile?
+    /// Inputs in the session that have written nothing for a few seconds. Shown until they record again.
+    @Published private(set) var notRecording: [NotRecordingInput] = []
 
     let outputSettings: OutputSettingsStore
     private var inputNames = InputNames()
@@ -241,10 +260,12 @@ final class AppModel: ObservableObject {
                 "label": tile.name,
                 "device": tile.source.input.displayName,
                 "armed": tile.isArmed,
-                "recording": tile.isRecording,
+                // A tally, so only while a file is being written, never while waiting for signal or restarting.
+                "recording": tile.isWriting,
                 "signal": tile.status.signal.format != nil,
             ]
             if let format = tile.status.signal.format { input["format"] = format.displayName }
+            if let reason = tile.notWriting { input["problem"] = reason.description }
             if let recorder = tile.recorderStatus {
                 input["frames"] = recorder.totalFrames
                 input["repeatedFrames"] = recorder.repeatedFrames
@@ -253,7 +274,8 @@ final class AppModel: ObservableObject {
             return input
         }
         var object: [String: Any] = [
-            "apiVersion": 2,
+            // 3: an input's `recording` means a file is being written, and `problem` says why one isn't.
+            "apiVersion": 3,
             "recording": isRecording,
             "finalizing": isFinalizing,
             "freeBytes": freeBytes,
@@ -377,7 +399,7 @@ final class AppModel: ObservableObject {
     /// Locked while the input records, since a segment keeps the timecode it started with. A recorder kept
     /// from earlier in the session is updated too, so the change reaches the input's next punch-in.
     func setTimecodeSource(_ tile: InputTile, _ source: TimecodeSource) {
-        guard !tile.isRecording, tile.timecodeSource != source else { return }
+        guard !tile.isInSession, tile.timecodeSource != source else { return }
         inputTimecodeSources.set(source, for: tile.id)
         tile.timecodeSource = source
         recorders[tile.id]?.setTimecodeSource(source)
@@ -420,7 +442,10 @@ final class AppModel: ObservableObject {
                     )
                 }
             }
-            armed.forEach { attach($0, to: session) }
+            armed.forEach {
+                attach($0, to: session)
+                noteCapture($0)
+            }
             session.startAll()
             self.session = session
             sessionStartedAt = Date()
@@ -446,17 +471,20 @@ final class AppModel: ObservableObject {
     /// Arms or disarms from a click or shortcut. Stopping an input mid-session waits for confirmation,
     /// because a stray click must not cut an angle.
     func requestToggleArmed(_ tile: InputTile) {
-        if tile.isRecording { pendingPunchOut = tile } else { setArmed(tile, !tile.isArmed) }
+        if tile.isInSession { pendingPunchOut = tile } else { setArmed(tile, !tile.isArmed) }
     }
 
     func stopAll() {
         guard let session else { return }
+        // How much each card delivered over the session, next to what was recorded from it.
+        tiles.filter { $0.recorder != nil }.forEach(noteCapture)
         session.stopAll()
         self.session = nil
         recorders = [:]
         punchedOut = []
         sessionStartedAt = nil
         isRecording = false
+        notRecording = []
         isFinalizing = true
         let tiles = tiles
         DispatchQueue.global(qos: .utility).async {
@@ -517,10 +545,35 @@ final class AppModel: ObservableObject {
     }
 
     private func refreshCounts() {
-        let recording = tiles.filter(\.isRecording).count
+        let recording = tiles.filter(\.isWriting).count
         let armed = tiles.filter(\.isArmed).count
         if recording != recordingCount { recordingCount = recording }
         if armed != armedCount { armedCount = armed }
+
+        let failing = session == nil ? [] : tiles.compactMap { tile in
+            tile.notWriting.map { NotRecordingInput(id: tile.id, name: tile.name, reason: $0) }
+        }
+        if failing != notRecording {
+            let newlyFailing = failing.filter { input in !notRecording.contains { $0.id == input.id } }
+            notRecording = failing
+            if !newlyFailing.isEmpty { raiseNotRecordingAlarm(newlyFailing) }
+        }
+    }
+
+    /// Sounds once and bounces the Dock icon until the app is looked at. The banner and tiles carry the
+    /// detail. The session file gets what capture was doing, which is what explains the gap afterwards.
+    private func raiseNotRecordingAlarm(_ inputs: [NotRecordingInput]) {
+        for input in inputs {
+            if let tile = tiles.first(where: { $0.id == input.id }) { noteCapture(tile) }
+        }
+        if let sound = NSSound(named: "Basso") { sound.play() } else { NSSound.beep() }
+        NSApp.requestUserAttention(.criticalRequest)
+    }
+
+    /// Writes what the input's capture is doing into its events, so a session file shows a card that never
+    /// started or never sent a frame. Nothing else would: the recorder only hears about frames that arrive.
+    private func noteCapture(_ tile: InputTile) {
+        tile.recorder?.note(tile.source.isCapturing ? "capture" : "capture_error", detail: tile.source.captureDescription)
     }
 
     private func attach(_ tile: InputTile, to session: RecordingSession) {
@@ -646,12 +699,22 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Matches each idle input's capture format to its codec: 8-bit for H.264, 10-bit for everything else.
+    /// What to ask the card for. Always 10-bit for now: asking a DeckLink Duo for 8-bit, for H.264, produced
+    /// no frames at all in the field (sessions of 2026-11-15 and 11-22), while 10-bit had worked on the same
+    /// card. `-captureEightBit YES` asks for 8-bit for H.264 again, so it can be tested and diagnosed from the
+    /// card counts in the session file. ffmpeg converts 10-bit to 8-bit for H.264, at some memory and CPU cost.
+    private func captureLayout(for inputID: String) -> PixelLayout {
+        guard UserDefaults.standard.bool(forKey: "captureEightBit") else { return .v210 }
+        return outputSettings.settings(for: inputID).codec.sourcePixelLayout
+    }
+
+    /// Matches each idle input's capture format to `captureLayout(for:)`.
     /// Settings are locked while recording, and an input that is recording is never restarted.
     private func applyCapturePixelLayouts() {
-        for tile in tiles where !tile.isRecording {
+        for tile in tiles where !tile.isInSession {
             do {
-                try tile.source.setPixelLayout(outputSettings.settings(for: tile.id).codec.sourcePixelLayout)
+                try tile.source.setPixelLayout(captureLayout(for: tile.id))
+                if tile.source.isCapturing { tile.errorMessage = nil }
             } catch {
                 tile.errorMessage = error.localizedDescription
             }
@@ -665,17 +728,19 @@ final class AppModel: ObservableObject {
         joinSession(tile)
         do {
             // Not running yet, so this only chooses the format the first start asks for.
-            try source.setPixelLayout(outputSettings.settings(for: source.input.id).codec.sourcePixelLayout)
+            try source.setPixelLayout(captureLayout(for: source.input.id))
             try source.start()
         } catch {
             tile.errorMessage = error.localizedDescription
         }
+        // An input that arrived mid-session has joined it by now, and its capture state belongs in the file.
+        noteCapture(tile)
     }
 
     private func remove(id: String) {
         guard let index = tiles.firstIndex(where: { $0.id == id }) else { return }
         let tile = tiles[index]
-        if tile.isRecording {
+        if tile.isInSession {
             // The file stays open for a return. Recording resumes in a new segment if the input comes back.
             tile.recorder?.inputLost()
         }

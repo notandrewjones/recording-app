@@ -300,6 +300,34 @@ Changes made in response:
 
 None of this is proven against the original failure until a long recording passes on the 8 GB M1.
 
+## 8-bit capture is off again, and an empty session can no longer look like a recording
+
+On 2026-11-15 the first service on v0.6.0-rc2 recorded nothing. The session ran 5 h 32 min with no
+segments, no ffmpeg and no events, while both tiles showed REC. On 2026-11-22 the same Mac showed
+"WAITING FOR INPUT" on both inputs with a signal plainly connected. That overlay means not one frame
+reached the frame handler. The only capture change since the last session that delivered frames was 8-bit
+capture for H.264.
+
+- **The card is asked for 10-bit for every codec again,** as on 2026-11-08. ffmpeg converts for H.264.
+  `-captureEightBit YES` brings back 8-bit for H.264, for testing only. A suspect, unconfirmed: the
+  format-change callback re-enables the input in the requested pixel format on every event, and the
+  SDK reports the detected bit depth. If a 10-bit signal raises an event against an 8-bit input each
+  time, the input would be reset forever without delivering a frame.
+- **Capture is now visible in the session file.** The bridge counts frame callbacks, unreadable frames
+  and format changes with the last detected mode and flags. The capture source counts frames it
+  passed on and frames it rejected for the wrong size. The app writes all of it as a `capture` event,
+  or `capture_error` if capture did not start, when recording starts, when an input stops writing, and
+  at stop. Each recorder logs `first_frame` with its format.
+- **REC means a file is being written.** An input waiting for signal, starting or retrying used to
+  count as recording on its tile, in the input count and in the control API. Now it shows STARTING
+  for the first few seconds. After 5 seconds with nothing written it shows NOT RECORDING with the
+  reason, a red banner appears, the alert sound plays once, the Dock icon bounces, and the session
+  file gets `not_writing`, then `writing_resumed` when it recovers. The API's per-input `recording`
+  is the tally (API version 3), and `problem` gives the reason.
+- **The report fails a session with nothing recorded** and says why where the file can tell: capture
+  failed, no video arrived, or never any signal. Sessions from before this change still get "No video
+  arrived from the capture card", because the first frame always logged a signal event.
+
 ## DeckLink headers are vendored and library validation is off in release builds
 
 CI has no SDK download, and GitHub secrets are too small to hold it. The headers' own licence allows
