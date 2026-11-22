@@ -65,7 +65,7 @@ export function UpdatePresets(self: IsoRecorderInstance): void {
 			id: 'inputs',
 			name: 'Inputs',
 			description: inputPresetIds.length
-				? 'Arm or disarm an input. During a recording this punches it in or out. Dim red is armed, bright red is recording, amber text means no signal, and amber fill means it should be recording but nothing is being saved.'
+				? 'Arm or disarm an input. During a recording this punches it in or out. Dim red is armed, bright red is recording, amber text means no signal, and amber fill means it should be recording but is not recording properly.'
 				: 'Connect to ISO Recorder to get a button for each input.',
 			definitions: inputPresetIds,
 		},

@@ -11,11 +11,12 @@ struct MarkerNote: Equatable, Identifiable {
     let elapsed: TimeInterval
 }
 
-/// An input that should be recording but has written nothing for a few seconds.
+/// An input that should be recording but is not recording properly: nothing written for a few seconds,
+/// or restarting over and over.
 struct NotRecordingInput: Equatable, Identifiable {
     let id: String
     let name: String
-    let reason: NotWritingReason
+    let reason: RecordingProblem
 }
 
 /// A reason recording isn't running, and the settings tab that fixes it, if any.
@@ -81,9 +82,9 @@ final class InputTile: ObservableObject, Identifiable {
     /// A file is being written now. Only this earns the REC tally.
     var isWriting: Bool { recorderStatus?.isWriting ?? false }
 
-    /// Why this input should be recording but has written nothing for a few seconds, including after
-    /// its recorder gave up.
-    var notWriting: NotWritingReason? { recorderStatus?.notWriting }
+    /// Why this input is not recording properly: nothing written for a few seconds, including after its
+    /// recorder gave up, or restarting over and over while a file is open.
+    var problem: RecordingProblem? { recorderStatus?.problem }
 }
 
 @MainActor
@@ -123,7 +124,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var failedStartCount = 0
     /// An input waiting for the operator to confirm stopping it mid-session.
     @Published var pendingPunchOut: InputTile?
-    /// Inputs in the session that have written nothing for a few seconds. Shown until they record again.
+    /// Inputs in the session that are not recording properly. Shown until they record properly again.
     @Published private(set) var notRecording: [NotRecordingInput] = []
 
     let outputSettings: OutputSettingsStore
@@ -265,7 +266,7 @@ final class AppModel: ObservableObject {
                 "signal": tile.status.signal.format != nil,
             ]
             if let format = tile.status.signal.format { input["format"] = format.displayName }
-            if let reason = tile.notWriting { input["problem"] = reason.description }
+            if let reason = tile.problem { input["problem"] = reason.description }
             if let recorder = tile.recorderStatus {
                 input["frames"] = recorder.totalFrames
                 input["repeatedFrames"] = recorder.repeatedFrames
@@ -545,13 +546,14 @@ final class AppModel: ObservableObject {
     }
 
     private func refreshCounts() {
-        let recording = tiles.filter(\.isWriting).count
+        // Matches the REC chip: writing, with nothing wrong.
+        let recording = tiles.filter { $0.isWriting && $0.problem == nil }.count
         let armed = tiles.filter(\.isArmed).count
         if recording != recordingCount { recordingCount = recording }
         if armed != armedCount { armedCount = armed }
 
         let failing = session == nil ? [] : tiles.compactMap { tile in
-            tile.notWriting.map { NotRecordingInput(id: tile.id, name: tile.name, reason: $0) }
+            tile.problem.map { NotRecordingInput(id: tile.id, name: tile.name, reason: $0) }
         }
         if failing != notRecording {
             let newlyFailing = failing.filter { input in !notRecording.contains { $0.id == input.id } }

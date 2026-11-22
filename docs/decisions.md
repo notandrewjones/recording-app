@@ -341,3 +341,28 @@ synthetic inputs through Homebrew ffmpeg. It has not been tried with a capture c
 ## Sparkle updates served from GitHub Pages
 
 Sparkle 2 with an appcast on the `gh-pages` branch, enclosures pointing at GitHub Release assets. The repo is public so no credential ships in the app. `releases/latest` was rejected because v0.x releases are prereleases, which it skips. Relaunch is postponed while segments are open so an update never cuts a recording.
+
+## The 8-bit storm, proven, and what an input that keeps restarting does now
+
+The 8-bit suspicion above turned out to be right about the mechanism. The "WAITING FOR INPUT" of 2026-11-22
+cleared when the DeckLink enclosure was power-cycled. With `captureEightBit` turned on, the next session
+(`2026-11-22_082733`) recorded 69 one-frame files per input in 10 seconds. Its `capture` events showed
+1,166 frame callbacks and 1,166 format changes, the last "colorspace changed; YCbCr 4:2:2 10-bit". The card
+reports the 10-bit signal as a format change after every frame while the input is enabled as 8-bit.
+
+- **The bridge only reconfigures the input for a new display mode or field order.** It used to pause,
+  re-enable, flush and restart on every format change, about 19 times a second per input here. The card
+  converts to the requested pixel format regardless, so a colour-space or bit-depth report is now only
+  counted. Capture runs whenever the app is open, so rc2 did this to the card around the clock for days
+  before it stopped sending frames. That is likely, not proven, to be what wedged it. 8-bit stays opt-in
+  until a session with `captureEightBit` shows frame callbacks at the full rate and `0 reconfigured`.
+- **A card clock that restarts while frames keep coming no longer starts a new file.** `FrameGapDetector`
+  checks host time when stream time runs backwards or jumps. If the frames kept arriving, it reports
+  `clockReset` with the frames missed by host time, and they are filled with repeats like any other gap.
+  Only a break on both clocks still starts a new segment.
+- **Restarting is a problem even while writing.** Five new files or clock resets within 10 seconds raise
+  `RecordingProblem.unstable`. The tile shows UNSTABLE instead of REC, the banner and alert fire, the
+  session file gets `unstable`, and the control API reports it as the input's `problem`.
+  `NotWritingReason` became `RecordingProblem`, since this one is not about writing.
+- **The report fails it.** rc3 passed the storm session. Now an `unstable` event fails, and so do five or
+  more files under a second long in one input, for sessions recorded before the event existed.

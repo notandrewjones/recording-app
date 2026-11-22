@@ -101,6 +101,8 @@ public struct SessionReport: Sendable {
     /// Early memory is ignored while rings and encoders settle.
     static let warmupSeconds = 60.0
     static let driftLimitFrames = 2.0
+    /// Files under a second long in one input that mean it kept restarting rather than one format change.
+    static let shortFileLimit = 5
 
     public var findings: [Finding] = []
     public var summary: [String] = []
@@ -148,6 +150,14 @@ public struct SessionReport: Sendable {
             if !notWriting.isEmpty {
                 let first = notWriting[0].detail.map { " First reason: \($0)." } ?? ""
                 findings.append(Finding(severity: .warning, message: "\(input.label): stopped writing \(notWriting.count) times while it should have been recording.\(first)"))
+            }
+            // Sessions from before `unstable` was logged still show it as a run of files under a second long.
+            let unstable = input.events.first { $0.kind == "unstable" }
+            let shortFiles = input.segments.filter { Double($0.frames) < $0.format.frameRate.doubleValue }.count
+            if let unstable {
+                findings.append(Finding(severity: .failure, message: "\(input.label): the input kept restarting. First: \(unstable.detail ?? "no detail")."))
+            } else if shortFiles >= Self.shortFileLimit {
+                findings.append(Finding(severity: .failure, message: "\(input.label): \(shortFiles) files under a second long. The input kept restarting."))
             }
         }
         if repeated > 0 { findings.append(Finding(severity: .failure, message: "\(input.label): \(repeated) repeated frames.")) }

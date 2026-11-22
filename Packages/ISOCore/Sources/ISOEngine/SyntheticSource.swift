@@ -4,12 +4,15 @@ import ISOCore
 /// Paced frames plus scripted faults. Stands in for a capture card anywhere above the SDK.
 public final class SyntheticSource: @unchecked Sendable {
     public enum Fault: Hashable, Sendable {
-        /// The source skips this many frames, as a card does when the host falls behind.
+        /// The source skips this many frames, as a card does when the host falls behind. The next frame
+        /// arrives late by that much, with stream time to match.
         case dropFrames(Int)
         case loseSignal(frames: Int)
         case changeFormat(VideoFormat)
         /// Frame delivery stops altogether for this long, as when hardware is unplugged.
         case stopDelivering(seconds: Double)
+        /// Stream time starts again from zero and this many frames are lost, as when a card restarts its input.
+        case restartClock(lostFrames: Int)
     }
 
     public static let streamTimeScale: Int64 = 240_000
@@ -78,6 +81,11 @@ public final class SyntheticSource: @unchecked Sendable {
                     streamTicks += Int64(count) * ticksPerFrame
                     cadenceFrame += UInt64(count)
                     nextDue += UInt64(count) * periodNanos
+                    // Both clocks show the gap on the same frame, so the wait comes before it.
+                    if realtime {
+                        let now = DispatchTime.now().uptimeNanoseconds
+                        if nextDue > now { usleep(UInt32((nextDue - now) / 1000)) }
+                    }
                 case .loseSignal(let frames):
                     noSignalRemaining = frames
                 case .changeFormat(let newFormat):
@@ -87,6 +95,15 @@ public final class SyntheticSource: @unchecked Sendable {
                 case .stopDelivering(let seconds):
                     usleep(UInt32(seconds * 1_000_000))
                     nextDue = DispatchTime.now().uptimeNanoseconds
+                case .restartClock(let lostFrames):
+                    // The card pauses, then resumes from zero, so the wait comes before this frame.
+                    streamTicks = 0
+                    cadenceFrame += UInt64(lostFrames)
+                    nextDue += UInt64(lostFrames) * periodNanos
+                    if realtime {
+                        let now = DispatchTime.now().uptimeNanoseconds
+                        if nextDue > now { usleep(UInt32((nextDue - now) / 1000)) }
+                    }
                 }
             }
 

@@ -167,10 +167,12 @@ struct MultiviewScreen: View {
 
     static func notRecordingText(_ inputs: [NotRecordingInput]) -> String {
         if inputs.count == 1, let input = inputs.first {
-            return "\(input.name) is not recording: \(input.reason.description). Nothing is being saved for it."
+            return input.reason.savesNothing
+                ? "\(input.name) is not recording: \(input.reason.description). Nothing is being saved for it."
+                : "\(input.name) is not recording properly: \(input.reason.description)."
         }
         let list = inputs.map { "\($0.name) (\($0.reason.description))" }.joined(separator: ", ")
-        return "\(inputs.count) inputs are not recording: \(list). Nothing is being saved for them."
+        return "\(inputs.count) inputs are not recording properly: \(list)."
     }
 
     /// Problems that stop or threaten a recording, most serious first.
@@ -559,25 +561,28 @@ struct InputTileView: View {
     }
 
     private var stateDescription: String {
+        if let reason = tile.problem { return "not recording properly, \(reason.description)" }
         if tile.isWriting { return "recording" }
-        if let reason = tile.notWriting { return "not recording, \(reason.description)" }
         if tile.isInSession { return "starting" }
         if !tile.isArmed { return sessionActive ? "not recording" : "not armed" }
         return "armed"
     }
 
-    /// Red only while a file is being written. Amber while a session runs and nothing is saved for this
-    /// input, whether it was disarmed or is failing. Otherwise a hairline.
+    /// Red only while a file is being written properly. Amber while a session runs and this input is not
+    /// recording properly, whether it was disarmed, is failing or keeps restarting. Otherwise a hairline.
     private var borderColor: Color {
+        if tile.problem != nil, sessionActive { return Palette.warning }
         if tile.isWriting { return Palette.tally }
-        if sessionActive, !tile.isArmed || tile.notWriting != nil { return Palette.warning }
+        if sessionActive, !tile.isArmed { return Palette.warning }
         return Palette.line
     }
 
     private var overlayMessage: String? {
         if let error = tile.errorMessage { return error }
         // Before the signal states: a card that stops sending leaves its last picture and "locked" behind.
-        if let reason = tile.notWriting { return "NOT RECORDING: \(reason.description.uppercased())" }
+        if let reason = tile.problem {
+            return "\(reason.savesNothing ? "NOT RECORDING" : "UNSTABLE"): \(reason.description.uppercased())"
+        }
         switch tile.status.signal {
         case .noSignal: return "NO SIGNAL"
         case .unknown: return "WAITING FOR INPUT"
@@ -606,11 +611,12 @@ struct InputTileView: View {
                 .lineLimit(1)
                 .onTapGesture(count: 2, perform: beginRename)
                 .help(tile.name == tile.source.input.displayName ? "Double-click to rename" : "\(tile.source.input.displayName). Double-click to rename.")
-            // Armed is the normal state, so only the exceptions are labelled. REC means a file is being written.
-            if tile.isWriting {
+            // Armed is the normal state, so only the exceptions are labelled. REC means a file is being
+            // written and nothing is wrong with it.
+            if let problem = tile.problem {
+                StateChip(text: problem.savesNothing ? "NOT RECORDING" : "UNSTABLE", foreground: .black, fill: Palette.warning)
+            } else if tile.isWriting {
                 StateChip(text: "REC", foreground: .white, fill: Palette.tally)
-            } else if tile.notWriting != nil {
-                StateChip(text: "NOT RECORDING", foreground: .black, fill: Palette.warning)
             } else if tile.isInSession {
                 StateChip(text: "STARTING", foreground: Palette.primaryText, fill: Palette.control, stroke: Palette.secondary)
             } else if !tile.isArmed {

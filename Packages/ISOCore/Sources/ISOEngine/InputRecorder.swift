@@ -42,11 +42,15 @@ public struct InputRecorderSettings: Sendable {
     public var allowSoftwareProRes: Bool
     /// Where each segment's starting timecode comes from. `InputRecorder.setTimecodeSource` changes it later.
     public var timecodeSource: TimecodeSource
-    /// Recording requested but no file written for this long raises `InputRecorderStatus.notWriting`.
+    /// Recording requested but no file written for this long raises `InputRecorderStatus.problem`.
     /// Long enough to ride out a normal start or a quick restart.
     public var notWritingAlarmSeconds: Double
+    /// This many restarts, new files or card clock resets, within `instabilityWindowSeconds` raise
+    /// `RecordingProblem.unstable`. A format change or a punch-in is one; a flapping input is many.
+    public var instabilityLimit: Int
+    public var instabilityWindowSeconds: Double
 
-    public init(codec: Codec = .proResLT, audio: AudioFormat? = AudioFormat(channels: 16), ringSeconds: Double = 1, stallSeconds: Double = 10, signalTimeoutSeconds: Double = 1, fullSyncSeconds: Double = 2, allowSoftwareProRes: Bool = false, timecodeSource: TimecodeSource = .source, hardStallSeconds: Double = 30, slowSeconds: Double = 5, notWritingAlarmSeconds: Double = 5) {
+    public init(codec: Codec = .proResLT, audio: AudioFormat? = AudioFormat(channels: 16), ringSeconds: Double = 1, stallSeconds: Double = 10, signalTimeoutSeconds: Double = 1, fullSyncSeconds: Double = 2, allowSoftwareProRes: Bool = false, timecodeSource: TimecodeSource = .source, hardStallSeconds: Double = 30, slowSeconds: Double = 5, notWritingAlarmSeconds: Double = 5, instabilityLimit: Int = 5, instabilityWindowSeconds: Double = 10) {
         self.codec = codec
         self.audio = audio
         self.ringSeconds = ringSeconds
@@ -58,6 +62,8 @@ public struct InputRecorderSettings: Sendable {
         self.allowSoftwareProRes = allowSoftwareProRes
         self.timecodeSource = timecodeSource
         self.notWritingAlarmSeconds = notWritingAlarmSeconds
+        self.instabilityLimit = instabilityLimit
+        self.instabilityWindowSeconds = instabilityWindowSeconds
     }
 }
 
@@ -77,8 +83,9 @@ public struct InputRecorderStatus: Sendable {
     public var ffmpegProcessIdentifier: Int32?
     /// A file is being written. False while waiting for signal, starting, restarting or after giving up.
     public var isWriting: Bool
-    /// Set once recording has been requested with no file written for `notWritingAlarmSeconds`.
-    public var notWriting: NotWritingReason?
+    /// Set once recording has been requested with no file written for `notWritingAlarmSeconds`, or while
+    /// the input keeps restarting.
+    public var problem: RecordingProblem?
     /// Frames the capture source has handed over since this recorder was created, with or without signal.
     public var framesReceived: Int
 }
@@ -138,6 +145,9 @@ public final class InputRecorder: @unchecked Sendable {
     private var notWritingEpisode = 0
     /// Whether this stretch has been logged as `not_writing`, so its end is logged too.
     private var notWritingLogged = false
+    /// Recent new files and card clock resets, oldest first, for spotting an input that keeps restarting.
+    private var recentRestarts: [(uptime: UInt64, isNewFile: Bool)] = []
+    private var lastUnstableLogUptime: UInt64?
 
     init(id: String, label: String, settings: InputRecorderSettings, store: SessionStore, finalizer: Finalizer, environment: FFmpegEnvironment, socketDirectory: String, socketPrefix: String) {
         self.id = id
@@ -191,12 +201,15 @@ public final class InputRecorder: @unchecked Sendable {
         }
         guard let target else { return }
 
-        let gap = lock.withLock { gapDetector?.observe(streamTime: frame.streamTime) ?? .continuous }
+        let gap = lock.withLock { gapDetector?.observe(streamTime: frame.streamTime, hostNanos: frame.hostTimeNanos) ?? .continuous }
         switch gap {
         case .continuous:
             break
         case .missing(let count):
             target.markMissing(count)
+        case .clockReset(let missing):
+            if missing > 0 { target.markMissing(missing) }
+            queue.async { [self] in noteRestart(isNewFile: false) }
         case .discontinuity:
             let shouldRoll = lock.withLock {
                 defer { rolloverPending = true }
@@ -277,7 +290,7 @@ public final class InputRecorder: @unchecked Sendable {
     public func status() -> InputRecorderStatus {
         queue.sync {
             let now = DispatchTime.now().uptimeNanoseconds
-            let alarmed = notWritingSinceUptime.map { HostTime.seconds(from: $0, to: now) >= settings.notWritingAlarmSeconds } ?? false
+            let notWriting = notWritingSinceUptime.map { HostTime.seconds(from: $0, to: now) >= settings.notWritingAlarmSeconds } ?? false
             let live = current?.counters ?? (0, 0)
             let segment: Int?
             switch watchdog.state {
@@ -297,7 +310,7 @@ public final class InputRecorder: @unchecked Sendable {
                 bytesWritten: bytesWritten,
                 ffmpegProcessIdentifier: current?.processIdentifier,
                 isWriting: isWriting,
-                notWriting: alarmed ? notWritingReason(now: now) : nil,
+                problem: notWriting ? notWritingReason(now: now) : instability(now: now),
                 framesReceived: lock.withLock { framesReceived }
             )
         }
@@ -349,9 +362,26 @@ public final class InputRecorder: @unchecked Sendable {
         }
     }
 
-    private func notWritingReason(now: UInt64) -> NotWritingReason {
+    /// Counts a restart, and logs `unstable` at most once per window while restarts keep coming.
+    private func noteRestart(isNewFile: Bool) {
+        let now = DispatchTime.now().uptimeNanoseconds
+        recentRestarts.append((now, isNewFile))
+        guard let problem = instability(now: now) else { return }
+        if let last = lastUnstableLogUptime, HostTime.seconds(from: last, to: now) < settings.instabilityWindowSeconds { return }
+        lastUnstableLogUptime = now
+        let files = recentRestarts.filter(\.isNewFile).count
+        log("unstable", detail: "\(problem.description): \(files) new files, \(recentRestarts.count - files) card clock resets")
+    }
+
+    private func instability(now: UInt64) -> RecordingProblem? {
+        recentRestarts.removeAll { HostTime.seconds(from: $0.uptime, to: now) > settings.instabilityWindowSeconds }
+        guard recentRestarts.count >= settings.instabilityLimit else { return nil }
+        return .unstable(restarts: recentRestarts.count, seconds: Int(settings.instabilityWindowSeconds.rounded()))
+    }
+
+    private func notWritingReason(now: UInt64) -> RecordingProblem {
         let (lastFrame, hasSignal) = lock.withLock { (lastFrameUptime, lastSignal == true) }
-        return NotWritingReason(
+        return RecordingProblem(
             state: watchdog.state,
             secondsSinceFrame: lastFrame.map { HostTime.seconds(from: $0, to: now) },
             hasSignal: hasSignal,
@@ -415,6 +445,7 @@ public final class InputRecorder: @unchecked Sendable {
             timecodeSource: currentTimecodeSource
         )
         let recorder = SegmentRecorder(configuration: configuration, ring: ring)
+        noteRestart(isNewFile: true)
         recorder.onOpened = { [self] opening in
             queue.async { [self] in recordOpening(opening, number: number, format: format, configuration: configuration) }
         }

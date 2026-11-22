@@ -66,7 +66,7 @@ export function UpdateFeedbacks(self: IsoRecorderInstance): void {
 		not_recording: {
 			type: 'boolean',
 			name: 'An input is not recording',
-			description: 'A session is running, but an armed input has saved nothing for a few seconds.',
+			description: 'A session is running, but an armed input has saved nothing for a few seconds, or keeps restarting.',
 			defaultStyle: { bgcolor: Colors.warning, color: Colors.black },
 			options: [],
 			callback: () => self.status?.inputs.some((input) => input.problem !== undefined) === true,
@@ -98,7 +98,8 @@ export function UpdateFeedbacks(self: IsoRecorderInstance): void {
 		input_not_recording: {
 			type: 'boolean',
 			name: 'Input: not recording',
-			description: 'This input should be recording, but nothing is being saved for it. input_N_problem says why.',
+			description:
+				'This input should be recording, but nothing is being saved for it or it keeps restarting. input_N_problem says why.',
 			defaultStyle: { bgcolor: Colors.warning, color: Colors.black },
 			options: [inputOption],
 			callback: (feedback) => input(feedback.options)?.problem !== undefined,

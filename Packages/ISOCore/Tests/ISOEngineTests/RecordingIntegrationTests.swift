@@ -204,7 +204,8 @@ import Testing
 
     @Test func gapTooLongToFillStartsANewSegment() throws {
         let source = SyntheticSource(faults: [60: .dropFrames(600)])
-        let harness = try Harness(environment: environment, source: source)
+        // The 10 s gap would otherwise count as signal loss first, which closes the segment another way.
+        let harness = try Harness(environment: environment, settings: InputRecorderSettings(signalTimeoutSeconds: 15, fullSyncSeconds: 0), source: source)
         harness.record(frames: 150)
 
         let segments = harness.segments
@@ -300,12 +301,12 @@ import Testing
         let harness = try Harness(environment: environment, settings: InputRecorderSettings(fullSyncSeconds: 0, notWritingAlarmSeconds: 0.5), source: SyntheticSource())
         harness.recorder.startRecording()
         Thread.sleep(forTimeInterval: 0.2)
-        #expect(harness.recorder.status().notWriting == nil, "too early to raise")
+        #expect(harness.recorder.status().problem == nil, "too early to raise")
         Thread.sleep(forTimeInterval: 0.6)
 
         let status = harness.recorder.status()
         #expect(!status.isWriting)
-        #expect(status.notWriting == .noVideo)
+        #expect(status.problem == .noVideo)
         #expect(status.framesReceived == 0)
         harness.finish()
 
@@ -321,13 +322,13 @@ import Testing
         let harness = try Harness(environment: environment, settings: InputRecorderSettings(fullSyncSeconds: 0, notWritingAlarmSeconds: 0.5), source: SyntheticSource())
         harness.recorder.startRecording()
         Thread.sleep(forTimeInterval: 0.8)
-        #expect(harness.recorder.status().notWriting == .noVideo)
+        #expect(harness.recorder.status().problem == .noVideo)
 
         harness.source.start(frames: 120)
         harness.source.waitUntilFinished()
         let status = harness.recorder.status()
         #expect(status.isWriting)
-        #expect(status.notWriting == nil)
+        #expect(status.problem == nil)
         #expect(status.framesReceived == 120)
         harness.finish()
 
@@ -345,6 +346,50 @@ import Testing
         let kinds = harness.session.store.snapshot.inputs[0].events.map(\.kind)
         #expect(kinds.contains("first_frame"))
         #expect(!kinds.contains("not_writing"))
+    }
+
+    /// The 8-bit storm of 2026-11-22: the card restarted its clock after every few frames. It must stay
+    /// one file at the real frame rate, with the gaps filled, and raise the alarm.
+    @Test func clockRestartStormStaysInOneFileAndRaisesUnstable() throws {
+        var faults: [UInt64: SyntheticSource.Fault] = [:]
+        for frame in stride(from: UInt64(60), to: 180, by: 4) { faults[frame] = .restartClock(lostFrames: 2) }
+        let harness = try Harness(environment: environment, source: SyntheticSource(faults: faults))
+        harness.source.start(frames: 240)
+        Thread.sleep(forTimeInterval: 0.1)
+        harness.recorder.startRecording()
+        Thread.sleep(forTimeInterval: 2.5)
+        let status = harness.recorder.status()
+        guard case .unstable(let restarts, let seconds)? = status.problem else {
+            Issue.record("expected unstable, got \(String(describing: status.problem))")
+            return
+        }
+        #expect(restarts >= 5 && seconds == 10)
+        #expect(status.isWriting)
+        harness.source.waitUntilFinished()
+        Thread.sleep(forTimeInterval: 0.2)
+        harness.finish()
+
+        let segments = harness.segments
+        #expect(segments.count == 1)
+        let segment = try #require(segments.first)
+        #expect(segment.state == .finalized)
+        // 240 delivered plus 2 filled for each of the 30 restarts, less the few before the ring existed.
+        #expect((280...302).contains(segment.frames), "\(segment.frames) frames")
+        #expect(segment.repeatedFrames >= 50)
+        let events = harness.session.store.snapshot.inputs[0].events
+        #expect(events.filter { $0.kind == "unstable" }.count == 1)
+        let report = try SessionAnalysis.report(directory: harness.session.layout.sessionDirectory)
+        #expect(report.findings.contains { $0.message.hasPrefix("Cam: the input kept restarting.") })
+    }
+
+    @Test func oneClockRestartIsFilledWithoutFuss() throws {
+        let harness = try Harness(environment: environment, source: SyntheticSource(faults: [90: .restartClock(lostFrames: 3)]))
+        harness.record(frames: 180)
+        let segments = harness.segments
+        #expect(segments.count == 1)
+        #expect((168...185).contains(segments.first?.frames ?? 0), "\(segments.first?.frames ?? 0) frames")
+        #expect(!harness.session.store.snapshot.inputs[0].events.contains { $0.kind == "unstable" })
+        #expect(harness.recorder.status().problem == nil)
     }
 
     @Test func killedFFmpegRestartsIntoANewSegment() throws {

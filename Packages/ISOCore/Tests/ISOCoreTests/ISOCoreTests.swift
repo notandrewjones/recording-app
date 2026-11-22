@@ -466,23 +466,44 @@ import Testing
         FrameGapDetector(frameRate: Rational(60000, 1001), streamTimeScale: 240_000, maximumFill: 10)
     }
 
+    /// Host time of frame `n` at 59.94.
+    func host(_ frame: Double) -> UInt64 {
+        UInt64(frame * 1_001_000_000 / 60)
+    }
+
     @Test func consecutiveFramesAreContinuous() {
         var gap = detector()
-        #expect(gap.observe(streamTime: 0) == .continuous)
-        #expect(gap.observe(streamTime: 4004) == .continuous)
+        #expect(gap.observe(streamTime: 0, hostNanos: host(0)) == .continuous)
+        #expect(gap.observe(streamTime: 4004, hostNanos: host(1)) == .continuous)
     }
 
     @Test func countsMissingFrames() {
         var gap = detector()
-        _ = gap.observe(streamTime: 0)
-        #expect(gap.observe(streamTime: 4004 * 4) == .missing(3))
+        _ = gap.observe(streamTime: 0, hostNanos: host(0))
+        #expect(gap.observe(streamTime: 4004 * 4, hostNanos: host(4)) == .missing(3))
     }
 
-    @Test func largeJumpsAndBackwardsTimeBreakTheTimeline() {
+    @Test func breaksOnBothClocksBreakTheTimeline() {
         var gap = detector()
-        _ = gap.observe(streamTime: 4004 * 100)
-        #expect(gap.observe(streamTime: 4004 * 200) == .discontinuity)
-        #expect(gap.observe(streamTime: 0) == .discontinuity)
+        _ = gap.observe(streamTime: 4004 * 100, hostNanos: host(100))
+        #expect(gap.observe(streamTime: 4004 * 200, hostNanos: host(200)) == .discontinuity)
+        #expect(gap.observe(streamTime: 0, hostNanos: host(300)) == .discontinuity)
+    }
+
+    /// What the DeckLink did on 2026-11-22 when asked for 8-bit from a 10-bit signal: it restarted its input
+    /// after every frame, and stream time went back to zero each time while frames kept coming.
+    @Test func cardClockRestartingIsFilledByHostTime() {
+        var gap = detector()
+        _ = gap.observe(streamTime: 4004 * 50, hostNanos: host(50))
+        #expect(gap.observe(streamTime: 0, hostNanos: host(53)) == .clockReset(missing: 2))
+        #expect(gap.observe(streamTime: 4004, hostNanos: host(54)) == .continuous)
+        #expect(gap.observe(streamTime: 0, hostNanos: host(55)) == .clockReset(missing: 0))
+    }
+
+    @Test func clockJumpingAheadWhileFramesKeepComingIsAReset() {
+        var gap = detector()
+        _ = gap.observe(streamTime: 0, hostNanos: host(0))
+        #expect(gap.observe(streamTime: 4004 * 500, hostNanos: host(1)) == .clockReset(missing: 0))
     }
 }
 
@@ -1107,6 +1128,38 @@ import Testing
             == "Not writing: the recorder gave up (ffmpeg exited with code 1).")
     }
 
+    @Test func restartingInputFails() {
+        var manifest = manifest()
+        manifest.inputs[0].events = [.init(hostNanos: 0, kind: "unstable", detail: "the input keeps restarting (5 times in 10 s): 0 new files, 5 card clock resets")]
+        let report = SessionReport(manifest: manifest, health: steadyHealth(), timings: [])
+        #expect(!report.passed)
+        #expect(report.findings.first?.message == "Cam 1: the input kept restarting. First: the input keeps restarting (5 times in 10 s): 0 new files, 5 card clock resets.")
+    }
+
+    /// The 2026-11-22 08:27 session: 69 one-frame files per input, which rc3's report passed.
+    @Test func runOfSubSecondFilesFails() {
+        var manifest = manifest()
+        let segment = manifest.inputs[0].segments[0]
+        manifest.inputs[0].segments = (1...6).map { number in
+            var short = segment
+            short.number = number
+            short.frames = 1
+            return short
+        }
+        let report = SessionReport(manifest: manifest, health: steadyHealth(), timings: [])
+        #expect(!report.passed)
+        #expect(report.findings.map(\.message) == ["Cam 1: 6 files under a second long. The input kept restarting."])
+    }
+
+    @Test func oneShortFileFromAFormatChangePasses() {
+        var manifest = manifest()
+        var short = manifest.inputs[0].segments[0]
+        short.number = 2
+        short.frames = 10
+        manifest.inputs[0].segments.append(short)
+        #expect(SessionReport(manifest: manifest, health: steadyHealth(), timings: []).findings.isEmpty)
+    }
+
     @Test func stretchesWithoutWritingWarn() {
         var manifest = manifest()
         manifest.inputs[0].events = [.init(hostNanos: 0, kind: "not_writing", detail: "no signal"), .init(hostNanos: 1, kind: "writing_resumed", detail: "after 12.0 s")]
@@ -1116,25 +1169,32 @@ import Testing
     }
 }
 
-@Suite struct NotWritingReasonTests {
+@Suite struct RecordingProblemTests {
+    @Test func instabilityStillSavesFrames() {
+        let problem = RecordingProblem.unstable(restarts: 12, seconds: 10)
+        #expect(!problem.savesNothing)
+        #expect(problem.description == "the input keeps restarting (12 times in 10 s)")
+        #expect(RecordingProblem.noVideo.savesNothing)
+    }
+
     @Test func noFrameEverIsNoVideo() {
-        #expect(NotWritingReason(state: .waitingForSignal(nextSegment: 1), secondsSinceFrame: nil, hasSignal: false, frameTimeoutSeconds: 1) == .noVideo)
+        #expect(RecordingProblem(state: .waitingForSignal(nextSegment: 1), secondsSinceFrame: nil, hasSignal: false, frameTimeoutSeconds: 1) == .noVideo)
     }
 
     @Test func framesThatStoppedAreNoVideo() {
-        #expect(NotWritingReason(state: .waitingForSignal(nextSegment: 2), secondsSinceFrame: 3, hasSignal: false, frameTimeoutSeconds: 1) == .noVideo)
+        #expect(RecordingProblem(state: .waitingForSignal(nextSegment: 2), secondsSinceFrame: 3, hasSignal: false, frameTimeoutSeconds: 1) == .noVideo)
     }
 
     @Test func framesWithoutSignalAreNoSignal() {
-        #expect(NotWritingReason(state: .waitingForSignal(nextSegment: 1), secondsSinceFrame: 0.02, hasSignal: false, frameTimeoutSeconds: 1) == .noSignal)
+        #expect(RecordingProblem(state: .waitingForSignal(nextSegment: 1), secondsSinceFrame: 0.02, hasSignal: false, frameTimeoutSeconds: 1) == .noSignal)
     }
 
     @Test func liveSignalWithoutAFileIsARestart() {
-        #expect(NotWritingReason(state: .backingOff(nextSegment: 3, attempt: 2), secondsSinceFrame: 0.02, hasSignal: true, frameTimeoutSeconds: 1) == .restarting)
+        #expect(RecordingProblem(state: .backingOff(nextSegment: 3, attempt: 2), secondsSinceFrame: 0.02, hasSignal: true, frameTimeoutSeconds: 1) == .restarting)
     }
 
     @Test func givingUpWinsOverEverythingElse() {
-        #expect(NotWritingReason(state: .failed(reason: "output stalled"), secondsSinceFrame: 0.02, hasSignal: true, frameTimeoutSeconds: 1) == .failed("output stalled"))
+        #expect(RecordingProblem(state: .failed(reason: "output stalled"), secondsSinceFrame: 0.02, hasSignal: true, frameTimeoutSeconds: 1) == .failed("output stalled"))
     }
 }
 

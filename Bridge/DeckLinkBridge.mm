@@ -11,6 +11,8 @@ struct DLCaptureStats {
     std::atomic<uint64_t> frameCallbacks{0};
     std::atomic<uint64_t> unreadableFrames{0};
     std::atomic<uint64_t> formatChanges{0};
+    /// Format changes that reconfigured the input. The rest were left alone.
+    std::atomic<uint64_t> reconfigurations{0};
     std::mutex lastChangeLock;
     DLFormat lastFormat{};
     BMDVideoInputFormatChangedEvents lastEvents = 0;
@@ -20,6 +22,7 @@ struct DLCaptureStats {
         frameCallbacks = 0;
         unreadableFrames = 0;
         formatChanges = 0;
+        reconfigurations = 0;
         std::lock_guard<std::mutex> guard(lastChangeLock);
         lastFormat = DLFormat{};
         lastEvents = 0;
@@ -51,8 +54,8 @@ static DLFormat DLFormatFromMode(IDeckLinkDisplayMode *mode) {
 
 class DLInputCallback final : public IDeckLinkInputCallback {
 public:
-    DLInputCallback(IDeckLinkInput *input, BMDPixelFormat pixelFormat, DLCaptureStats *stats, DLFrameHandler frameHandler, DLFormatHandler formatHandler)
-        : input_(input), pixelFormat_(pixelFormat), stats_(stats), frameHandler_(frameHandler), formatHandler_(formatHandler) {}
+    DLInputCallback(IDeckLinkInput *input, BMDDisplayMode mode, BMDPixelFormat pixelFormat, DLCaptureStats *stats, DLFrameHandler frameHandler, DLFormatHandler formatHandler)
+        : input_(input), mode_(mode), pixelFormat_(pixelFormat), stats_(stats), frameHandler_(frameHandler), formatHandler_(formatHandler) {}
 
     HRESULT QueryInterface(REFIID, LPVOID *ppv) override {
         *ppv = nullptr;
@@ -73,8 +76,17 @@ public:
             stats_->lastEvents = events;
             stats_->lastFlags = flags;
         }
+        // Only a new display mode or field order needs the input reconfigured. The SDK also reports a colour
+        // space or bit depth that differs from the pixel format asked for, and a 10-bit signal captured as
+        // 8-bit raises that after every frame. The card converts to the pixel format asked for regardless.
+        // Restarting for it reset the input about 19 times a second and broke the recording into one-frame
+        // files (2026-11-22), and may be what left the card sending nothing until power-cycled.
+        const BMDDisplayMode detected = mode->GetDisplayMode();
+        if (detected == mode_ && (events & bmdVideoInputFieldDominanceChanged) == 0) return S_OK;
+        mode_ = detected;
+        stats_->reconfigurations++;
         input_->PauseStreams();
-        input_->EnableVideoInput(mode->GetDisplayMode(), pixelFormat_, bmdVideoInputEnableFormatDetection);
+        input_->EnableVideoInput(detected, pixelFormat_, bmdVideoInputEnableFormatDetection);
         input_->FlushStreams();
         input_->StartStreams();
         formatHandler_(DLFormatFromMode(mode));
@@ -137,6 +149,8 @@ private:
 
     std::atomic<ULONG> refCount_{1};
     IDeckLinkInput *input_;
+    /// The mode the input is enabled in. Only touched on the SDK's callback thread after construction.
+    BMDDisplayMode mode_;
     const BMDPixelFormat pixelFormat_;
     DLCaptureStats *stats_;
     DLFrameHandler frameHandler_;
@@ -214,8 +228,9 @@ private:
     const uint64_t callbacks = _stats->frameCallbacks;
     const uint64_t unreadable = _stats->unreadableFrames;
     const uint64_t changes = _stats->formatChanges;
-    NSMutableString *text = [NSMutableString stringWithFormat:@"%llu frame callbacks, %llu unreadable, %llu format change%@",
-        callbacks, unreadable, changes, changes == 1 ? @"" : @"s"];
+    const uint64_t reconfigurations = _stats->reconfigurations;
+    NSMutableString *text = [NSMutableString stringWithFormat:@"%llu frame callbacks, %llu unreadable, %llu format change%@, %llu reconfigured",
+        callbacks, unreadable, changes, changes == 1 ? @"" : @"s", reconfigurations];
     if (changes == 0) return text;
 
     DLFormat format;
@@ -273,7 +288,7 @@ private:
         }
     }
 
-    _callback = new DLInputCallback(_input, pixelFormat, _stats, frameHandler, formatHandler);
+    _callback = new DLInputCallback(_input, initialMode, pixelFormat, _stats, frameHandler, formatHandler);
     _input->SetCallback(_callback);
     result = _input->StartStreams();
     if (result != S_OK) {
