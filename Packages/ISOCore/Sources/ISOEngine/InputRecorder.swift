@@ -535,11 +535,12 @@ public final class InputRecorder: @unchecked Sendable {
     /// Keeps the ring and audio across a crash so frames not yet written carry over, with their sound. A new
     /// format needs new ones.
     private func prepareRing(for format: VideoFormat) -> (video: FrameRing, audio: AudioTimeline?) {
-        let existing = lock.withLock { (ring, audioTimeline) }
-        if let ring = existing.0, ring.format == format, !ring.isClosed {
-            return (ring, existing.1)
+        // `self.` is needed: older compilers bind a bare `ring` here to the local declared further down.
+        let existing: (video: FrameRing?, audio: AudioTimeline?) = lock.withLock { (self.ring, self.audioTimeline) }
+        if let kept = existing.video, kept.format == format, !kept.isClosed {
+            return (kept, existing.audio)
         }
-        if existing.1 != nil { logAudio(replacing: true) }
+        if existing.audio != nil { logAudio(replacing: true) }
         let rate = format.frameRate.doubleValue
         let slots = max(4, Int((rate * settings.ringSeconds).rounded(.up))) + 1
         let ring = FrameRing(format: format, slotCount: slots)
