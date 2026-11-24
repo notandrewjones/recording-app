@@ -3,6 +3,16 @@
     <channel>
         <title>ISORecorder</title>
         <item>
+            <title>0.6.0-rc6</title>
+            <pubDate>Tue, 24 Nov 2026 16:51:50 +0000</pubDate>
+            <link>https://github.com/notandrewjones/recording-app/releases/tag/v0.6.0-rc6</link>
+            <sparkle:version>14</sparkle:version>
+            <sparkle:shortVersionString>0.6.0-rc6</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://github.com/notandrewjones/recording-app/releases/download/v0.6.0-rc6/ISORecorder.dmg" length="2433116" type="application/octet-stream" sparkle:edSignature="29HMF5DJoEWB/AE1GgPaEqwBvPCfF/4U/u4yi8DtA0HN9g/j33D3Ln1GTugOjOQiKSPIUg/p7+4mu2qPRtIaCA=="/>
+        </item>
+        <item>
             <title>0.6.0-rc4</title>
             <pubDate>Sun, 22 Nov 2026 14:55:43 +0000</pubDate>
             <link>https://github.com/notandrewjones/recording-app/releases/tag/v0.6.0-rc4</link>
@@ -21,16 +31,6 @@
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
             <enclosure url="https://github.com/notandrewjones/recording-app/releases/download/v0.6.0-rc3/ISORecorder.dmg" length="2409752" type="application/octet-stream" sparkle:edSignature="3MUUwbGnschhs5G8keV2XLO9kLUMavJronHuoO02PTlBlSWPlE8KtmzzTjuEid0mW7DiHX93wihJteAMocmaCQ=="/>
-        </item>
-        <item>
-            <title>0.6.0-rc2</title>
-            <pubDate>Mon, 09 Nov 2026 14:25:35 +0000</pubDate>
-            <link>https://github.com/notandrewjones/recording-app/releases/tag/v0.6.0-rc2</link>
-            <sparkle:version>10</sparkle:version>
-            <sparkle:shortVersionString>0.6.0-rc2</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <enclosure url="https://github.com/notandrewjones/recording-app/releases/download/v0.6.0-rc2/ISORecorder.dmg" length="2392811" type="application/octet-stream" sparkle:edSignature="5MVKKeV1/IawY90A+W0SwTmnJzpFW6fZN7ld1FoeZmVXetyRTZ02qy9LRemN+nkT/KdWq6cmW6hdFjNYTXxABA=="/>
         </item>
     </channel>
 </rss>
