@@ -1175,6 +1175,16 @@ import Testing
         #expect(!problem.savesNothing)
         #expect(problem.description == "the input keeps restarting (12 times in 10 s)")
         #expect(RecordingProblem.noVideo.savesNothing)
+        #expect(problem.chipText == "UNSTABLE")
+        #expect(RecordingProblem.noVideo.chipText == "NOT RECORDING")
+    }
+
+    @Test func aRestartIsRaisedButStillSaves() {
+        let once = RecordingProblem.restarted(times: 1, minutes: 5)
+        #expect(!once.savesNothing)
+        #expect(once.chipText == "RESTARTED")
+        #expect(once.description == "the recorder had to restart (once in the last 5 min)")
+        #expect(RecordingProblem.restarted(times: 3, minutes: 5).description == "the recorder had to restart (3 times in the last 5 min)")
     }
 
     @Test func noFrameEverIsNoVideo() {

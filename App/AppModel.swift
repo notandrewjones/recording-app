@@ -132,6 +132,9 @@ final class AppModel: ObservableObject {
     private var inputTimecodeSources = InputTimecodeSources()
 
     private var session: RecordingSession?
+    /// Held from Record to Stop: no App Nap, no idle sleep, and the user kept active so macOS does not start
+    /// the maintenance it saves for an idle Mac. See `SystemActivity`.
+    private var recordingActivity: SystemActivity?
     /// Recorders in this session by input ID, kept so that a device that returns finds its recorder again.
     private var recorders: [String: InputRecorder] = [:]
     /// Inputs disarmed during this session, so one that disconnects and returns does not rejoin by itself.
@@ -448,6 +451,11 @@ final class AppModel: ObservableObject {
                 noteCapture($0)
             }
             session.startAll()
+            let activity = SystemActivity.recording()
+            if let failure = activity.userActivityFailure {
+                armed.forEach { $0.recorder?.note("keep_awake_failed", detail: failure) }
+            }
+            recordingActivity = activity
             self.session = session
             sessionStartedAt = Date()
             markerCount = 0
@@ -480,6 +488,10 @@ final class AppModel: ObservableObject {
         // How much each card delivered over the session, next to what was recorded from it.
         tiles.filter { $0.recorder != nil }.forEach(noteCapture)
         session.stopAll()
+        // Finishing still runs ffmpeg and verifies every file, so the app is kept awake until it is done.
+        recordingActivity?.end()
+        recordingActivity = nil
+        let finishing = SystemActivity.finishing()
         self.session = nil
         recorders = [:]
         punchedOut = []
@@ -490,6 +502,7 @@ final class AppModel: ObservableObject {
         let tiles = tiles
         DispatchQueue.global(qos: .utility).async {
             session.waitUntilFinished()
+            finishing.end()
             Task { @MainActor [weak self] in
                 tiles.forEach {
                     $0.source.sink.attach(nil)

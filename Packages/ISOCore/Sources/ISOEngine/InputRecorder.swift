@@ -13,8 +13,12 @@ public struct IngestFrame {
     public var streamTimeScale: Int64
     public var timecode: Timecode?
     public var hasSignal: Bool
+    /// When the first audio sample was captured, on the same clock and scale as `streamTime`. The card
+    /// stamps each audio packet, and a packet need not belong to the frame it arrives with. Nil means unknown,
+    /// and the audio is taken to start with the frame.
+    public var audioStreamTime: Int64?
 
-    public init(format: VideoFormat, video: UnsafeRawPointer, audio: UnsafeRawPointer?, audioSampleFrames: Int, hostTimeNanos: UInt64, streamTime: Int64, streamTimeScale: Int64, timecode: Timecode?, hasSignal: Bool) {
+    public init(format: VideoFormat, video: UnsafeRawPointer, audio: UnsafeRawPointer?, audioSampleFrames: Int, hostTimeNanos: UInt64, streamTime: Int64, streamTimeScale: Int64, timecode: Timecode?, hasSignal: Bool, audioStreamTime: Int64? = nil) {
         self.format = format
         self.video = video
         self.audio = audio
@@ -24,6 +28,25 @@ public struct IngestFrame {
         self.streamTimeScale = streamTimeScale
         self.timecode = timecode
         self.hasSignal = hasSignal
+        self.audioStreamTime = audioStreamTime
+    }
+}
+
+/// Audio the card delivered without a picture. DeckLink does this when it has no buffer free for the frame.
+public struct IngestAudio {
+    public var audio: UnsafeRawPointer
+    public var sampleFrames: Int
+    /// When the first sample was captured, on the video stream clock.
+    public var streamTime: Int64
+    public var streamTimeScale: Int64
+    public var hostTimeNanos: UInt64
+
+    public init(audio: UnsafeRawPointer, sampleFrames: Int, streamTime: Int64, streamTimeScale: Int64, hostTimeNanos: UInt64) {
+        self.audio = audio
+        self.sampleFrames = sampleFrames
+        self.streamTime = streamTime
+        self.streamTimeScale = streamTimeScale
+        self.hostTimeNanos = hostTimeNanos
     }
 }
 
@@ -49,8 +72,14 @@ public struct InputRecorderSettings: Sendable {
     /// `RecordingProblem.unstable`. A format change or a punch-in is one; a flapping input is many.
     public var instabilityLimit: Int
     public var instabilityWindowSeconds: Double
+    /// A recorder restart raises `RecordingProblem.restarted` for this long. Each one loses a moment of the
+    /// recording and repeats frames over it, so even one is worth knowing about while it can still be fixed.
+    public var restartAlarmSeconds: Double
+    /// How much audio each input keeps. It has to outlast a frozen recorder being found and replaced, so the
+    /// new file still has the audio for the frames it carries over.
+    public var audioBufferSeconds: Double
 
-    public init(codec: Codec = .proResLT, audio: AudioFormat? = AudioFormat(channels: 16), ringSeconds: Double = 1, stallSeconds: Double = 10, signalTimeoutSeconds: Double = 1, fullSyncSeconds: Double = 2, allowSoftwareProRes: Bool = false, timecodeSource: TimecodeSource = .source, hardStallSeconds: Double = 30, slowSeconds: Double = 5, notWritingAlarmSeconds: Double = 5, instabilityLimit: Int = 5, instabilityWindowSeconds: Double = 10) {
+    public init(codec: Codec = .proResLT, audio: AudioFormat? = AudioFormat(channels: 16), ringSeconds: Double = 1, stallSeconds: Double = 10, signalTimeoutSeconds: Double = 1, fullSyncSeconds: Double = 2, allowSoftwareProRes: Bool = false, timecodeSource: TimecodeSource = .source, hardStallSeconds: Double = 30, slowSeconds: Double = 5, notWritingAlarmSeconds: Double = 5, instabilityLimit: Int = 5, instabilityWindowSeconds: Double = 10, restartAlarmSeconds: Double = 300, audioBufferSeconds: Double = 15) {
         self.codec = codec
         self.audio = audio
         self.ringSeconds = ringSeconds
@@ -64,6 +93,8 @@ public struct InputRecorderSettings: Sendable {
         self.notWritingAlarmSeconds = notWritingAlarmSeconds
         self.instabilityLimit = instabilityLimit
         self.instabilityWindowSeconds = instabilityWindowSeconds
+        self.restartAlarmSeconds = restartAlarmSeconds
+        self.audioBufferSeconds = audioBufferSeconds
     }
 }
 
@@ -83,11 +114,13 @@ public struct InputRecorderStatus: Sendable {
     public var ffmpegProcessIdentifier: Int32?
     /// A file is being written. False while waiting for signal, starting, restarting or after giving up.
     public var isWriting: Bool
-    /// Set once recording has been requested with no file written for `notWritingAlarmSeconds`, or while
-    /// the input keeps restarting.
+    /// Set once recording has been requested with no file written for `notWritingAlarmSeconds`, while
+    /// the input keeps restarting, or for a while after the recorder had to restart.
     public var problem: RecordingProblem?
     /// Frames the capture source has handed over since this recorder was created, with or without signal.
     public var framesReceived: Int
+    /// What the card's audio has done since recording was first requested.
+    public var audio: AudioTimeline.Stats
 }
 
 /// Supervises one input's recording. All decisions come from `RecorderWatchdog`; this class performs them.
@@ -108,6 +141,8 @@ public final class InputRecorder: @unchecked Sendable {
     // Shared with the capture thread.
     private let lock = UnfairLock()
     private var ring: FrameRing?
+    /// Paired with `ring`: both number frames on the same timeline, and both are replaced together.
+    private var audioTimeline: AudioTimeline?
     private var lastSignal: Bool?
     private var lastFormat: VideoFormat?
     private var lastIngestUptime: UInt64 = 0
@@ -148,6 +183,12 @@ public final class InputRecorder: @unchecked Sendable {
     /// Recent new files and card clock resets, oldest first, for spotting an input that keeps restarting.
     private var recentRestarts: [(uptime: UInt64, isNewFile: Bool)] = []
     private var lastUnstableLogUptime: UInt64?
+    /// When the recorder had to be restarted while recording, oldest first, for `RecordingProblem.restarted`.
+    private var recorderRestarts: [UInt64] = []
+    /// Audio stats of timelines already replaced, and how much of the current one is in the session file.
+    private var closedAudioStats = AudioTimeline.Stats()
+    private var loggedAudioStats = AudioTimeline.Stats()
+    private var lastAudioLogUptime: UInt64 = 0
 
     init(id: String, label: String, settings: InputRecorderSettings, store: SessionStore, finalizer: Finalizer, environment: FFmpegEnvironment, socketDirectory: String, socketPrefix: String) {
         self.id = id
@@ -172,7 +213,7 @@ public final class InputRecorder: @unchecked Sendable {
         var events: [RecorderWatchdog.Event] = []
         var firstFrame: String?
 
-        let target: FrameRing? = lock.withLock {
+        let target: (ring: FrameRing, audio: AudioTimeline?)? = lock.withLock {
             lastIngestUptime = uptime
             lastFrameUptime = uptime
             framesReceived += 1
@@ -190,7 +231,7 @@ public final class InputRecorder: @unchecked Sendable {
             if let last = lastFormat, last != frame.format { events.append(.formatChanged) }
             lastFormat = frame.format
             guard let ring, ring.format == frame.format else { return nil }
-            return ring
+            return (ring, audioTimeline)
         }
 
         if firstFrame != nil || !events.isEmpty {
@@ -206,9 +247,9 @@ public final class InputRecorder: @unchecked Sendable {
         case .continuous:
             break
         case .missing(let count):
-            target.markMissing(count)
+            target.ring.markMissing(count)
         case .clockReset(let missing):
-            if missing > 0 { target.markMissing(missing) }
+            if missing > 0 { target.ring.markMissing(missing) }
             queue.async { [self] in noteRestart(isNewFile: false) }
         case .discontinuity:
             let shouldRoll = lock.withLock {
@@ -226,8 +267,22 @@ public final class InputRecorder: @unchecked Sendable {
 
         var metadata = FrameRing.Metadata(hostTimeNanos: frame.hostTimeNanos, streamTime: frame.streamTime, timecode: frame.timecode)
         metadata.noSignal = false
-        let bytesPerSample = (settings.audio?.channels ?? 0) * 4
-        target.push(video: frame.video, audio: frame.audio, audioBytes: frame.audioSampleFrames * bytesPerSample, metadata: metadata)
+        let pushed = target.ring.push(video: frame.video, metadata: metadata)
+        // Even a frame the ring had no room for moves the audio on, so ffmpeg never waits on a full ring.
+        target.audio?.frameArrived(
+            timelineFrame: pushed.timelineFrame,
+            streamTime: frame.streamTime,
+            streamTimeScale: frame.streamTimeScale,
+            audio: frame.audio,
+            sampleFrames: frame.audioSampleFrames,
+            audioStreamTime: frame.audioStreamTime
+        )
+    }
+
+    /// Audio that arrived without a picture. It goes on the timeline by its own time.
+    public func ingestAudio(_ packet: IngestAudio) {
+        let timeline = lock.withLock { lastSignal == true ? audioTimeline : nil }
+        timeline?.audioArrived(packet.audio, sampleFrames: packet.sampleFrames, streamTime: packet.streamTime, streamTimeScale: packet.streamTimeScale)
     }
 
     // MARK: Control
@@ -310,8 +365,9 @@ public final class InputRecorder: @unchecked Sendable {
                 bytesWritten: bytesWritten,
                 ffmpegProcessIdentifier: current?.processIdentifier,
                 isWriting: isWriting,
-                problem: notWriting ? notWritingReason(now: now) : instability(now: now),
-                framesReceived: lock.withLock { framesReceived }
+                problem: notWriting ? notWritingReason(now: now) : instability(now: now) ?? restartProblem(now: now),
+                framesReceived: lock.withLock { framesReceived },
+                audio: closedAudioStats + (lock.withLock { audioTimeline }?.currentStats ?? .init())
             )
         }
     }
@@ -379,6 +435,12 @@ public final class InputRecorder: @unchecked Sendable {
         return .unstable(restarts: recentRestarts.count, seconds: Int(settings.instabilityWindowSeconds.rounded()))
     }
 
+    private func restartProblem(now: UInt64) -> RecordingProblem? {
+        recorderRestarts.removeAll { HostTime.seconds(from: $0, to: now) > settings.restartAlarmSeconds }
+        guard !recorderRestarts.isEmpty else { return nil }
+        return .restarted(times: recorderRestarts.count, minutes: max(1, Int((settings.restartAlarmSeconds / 60).rounded())))
+    }
+
     private func notWritingReason(now: UInt64) -> RecordingProblem {
         let (lastFrame, hasSignal) = lock.withLock { (lastFrameUptime, lastSignal == true) }
         return RecordingProblem(
@@ -401,6 +463,7 @@ public final class InputRecorder: @unchecked Sendable {
                 current = nil
             case .scheduleRetry(let delay):
                 restarts += 1
+                if recordingRequested { recorderRestarts.append(DispatchTime.now().uptimeNanoseconds) }
                 queue.asyncAfter(deadline: .now() + delay) { [self] in send(.backoffElapsed) }
             case .log(let message):
                 log("recorder", detail: message)
@@ -429,6 +492,7 @@ public final class InputRecorder: @unchecked Sendable {
         }
         let ring = prepareRing(for: format)
         let layout = store.layout
+        try? FileManager.default.createDirectory(atPath: layout.workingDirectory(inputLabel: label), withIntermediateDirectories: true)
 
         let configuration = SegmentRecorder.Configuration(
             number: number,
@@ -444,7 +508,7 @@ public final class InputRecorder: @unchecked Sendable {
             allowSoftwareProRes: settings.allowSoftwareProRes,
             timecodeSource: currentTimecodeSource
         )
-        let recorder = SegmentRecorder(configuration: configuration, ring: ring)
+        let recorder = SegmentRecorder(configuration: configuration, ring: ring.video, audioTimeline: ring.audio)
         noteRestart(isNewFile: true)
         recorder.onOpened = { [self] opening in
             queue.async { [self] in recordOpening(opening, number: number, format: format, configuration: configuration) }
@@ -468,24 +532,50 @@ public final class InputRecorder: @unchecked Sendable {
         recorder.start()
     }
 
-    /// Keeps the ring across a crash so frames not yet written carry over. A new format needs a new one.
-    private func prepareRing(for format: VideoFormat) -> FrameRing {
-        if let existing = lock.withLock({ self.ring }), existing.format == format, !existing.isClosed {
-            existing.alignAudioToVideo()
-            return existing
+    /// Keeps the ring and audio across a crash so frames not yet written carry over, with their sound. A new
+    /// format needs new ones.
+    private func prepareRing(for format: VideoFormat) -> (video: FrameRing, audio: AudioTimeline?) {
+        let existing = lock.withLock { (ring, audioTimeline) }
+        if let ring = existing.0, ring.format == format, !ring.isClosed {
+            return (ring, existing.1)
         }
+        if existing.1 != nil { logAudio(replacing: true) }
         let rate = format.frameRate.doubleValue
         let slots = max(4, Int((rate * settings.ringSeconds).rounded(.up))) + 1
-        let audioBytes = AudioCadence.maximumSamplesPerFrame(frameRate: format.frameRate) * (settings.audio?.channels ?? 0) * 4
-        let ring = FrameRing(format: format, slotCount: slots, audioSlotBytes: audioBytes)
+        let ring = FrameRing(format: format, slotCount: slots)
         log("ring_memory", detail: "\(ring.memoryLock), \(ring.storageBytes / 1_048_576) MB")
+        let timeline = settings.audio.map {
+            AudioTimeline(channels: $0.channels, frameRate: format.frameRate, capacitySeconds: settings.audioBufferSeconds)
+        }
+        if let timeline {
+            let megabytes = Double(timeline.storageBytes) / 1_048_576
+            log("audio_memory", detail: "\(timeline.memoryLock), \(String(format: "%.1f", megabytes)) MB for \(Int(settings.audioBufferSeconds.rounded())) s")
+        }
         let fill = max(1, Int(rate * 2))
         lock.withLock {
             self.ring = ring
+            audioTimeline = timeline
             gapDetector = FrameGapDetector(frameRate: format.frameRate, streamTimeScale: 240_000, maximumFill: fill)
             rolloverPending = false
         }
-        return ring
+        return (ring, timeline)
+    }
+
+    /// Logs what the card's audio did since the last report, if anything was out of the ordinary. Call it
+    /// with `replacing` before the timeline is dropped, so its last stretch is not lost.
+    private func logAudio(replacing: Bool = false) {
+        guard let timeline = lock.withLock({ audioTimeline }) else { return }
+        let stats = timeline.currentStats
+        let since = stats - loggedAudioStats
+        if since.hasIrregularities {
+            log("audio", detail: since.description)
+            loggedAudioStats = stats
+        }
+        lastAudioLogUptime = DispatchTime.now().uptimeNanoseconds
+        if replacing {
+            closedAudioStats = closedAudioStats + stats
+            loggedAudioStats = .init()
+        }
     }
 
     private func recordOpening(_ opening: SegmentRecorder.Opening, number: Int, format: VideoFormat, configuration: SegmentRecorder.Configuration) {
@@ -521,17 +611,17 @@ public final class InputRecorder: @unchecked Sendable {
     /// Closes the ring so the writer drains it, and ffmpeg exits on EOF.
     private func closeCurrent() {
         guard current != nil else { return }
-        lock.withLock {
-            ring?.close()
-            ring = nil
-        }
+        discardRing()
         current = nil
     }
 
+    /// The writer keeps its own references, so it can still drain what the ring and timeline hold.
     private func discardRing() {
+        logAudio(replacing: true)
         lock.withLock {
             ring?.close()
             ring = nil
+            audioTimeline = nil
         }
     }
 
@@ -568,6 +658,7 @@ public final class InputRecorder: @unchecked Sendable {
         for path in [configuration.workingPath, configuration.indexPath, configuration.logPath] {
             unlink(path)
         }
+        Finalizer.removeWorkingDirectoryIfEmpty(containing: configuration.workingPath)
         let inputID = id
         store.update { manifest in
             guard let index = manifest.inputs.firstIndex(where: { $0.id == inputID }) else { return }
@@ -641,6 +732,8 @@ public final class InputRecorder: @unchecked Sendable {
                 }
             }
         }
+
+        if HostTime.seconds(from: lastAudioLogUptime, to: now) >= 60 { logAudio() }
 
         if let since = healthySinceUptime, HostTime.seconds(from: since, to: now) > 30 {
             watchdog.markHealthy()

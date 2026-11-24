@@ -27,8 +27,9 @@ GitHub Release and leaves the `.dmg` as a workflow artifact.
 
 The workflow only runs on a tag if the tagged commit contains it.
 
-CI runs `ISOCoreTests` and `FrameRingTests`. Run the integration tests locally before tagging, because
-runner VMs have no hardware ProRes: `cd Packages/ISOCore && swift test`.
+CI runs `ISOCoreTests`, `FrameRingTests` and `AudioTimelineTests`. Run the rest locally before tagging,
+because runner VMs have no hardware ProRes, and `SystemActivityTests` needs a logged-in Mac:
+`cd Packages/ISOCore && swift test`.
 
 ## Building locally
 

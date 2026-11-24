@@ -2,7 +2,12 @@ import Foundation
 
 /// On-disk layout of one recording session:
 /// `<root>/<session>/<input>/<input>_0001.mov` plus matching `.idx` and `.log` files, and `<root>/<session>/session.json`.
-/// While recording, the media is the fragmented `<input>_0001.part.mov`.
+/// While recording, the media is the fragmented `<input>/.recording.noindex/<input>_0001.part.mov`.
+///
+/// Spotlight never looks inside a folder whose name ends in `.noindex` or starts with a dot, so a file that
+/// grows for hours is not imported over and over, or handed to media analysis, while it records. Finished
+/// files sit beside it and are indexed once, as usual. A `.metadata_never_index` file does nothing for a
+/// folder on current macOS, and naming the session or input folders `.noindex` would show in every editor.
 public struct SessionLayout: Hashable, Sendable {
     public var rootPath: String
     public var sessionName: String
@@ -23,8 +28,15 @@ public struct SessionLayout: Hashable, Sendable {
         (inputDirectory(inputLabel: inputLabel) as NSString).appendingPathComponent("\(segmentStem(inputLabel, segment)).mov")
     }
 
+    /// Where media goes while it is recorded. Hidden, and out of Spotlight's reach.
+    public static let workingDirectoryName = ".recording.noindex"
+
+    public func workingDirectory(inputLabel: String) -> String {
+        (inputDirectory(inputLabel: inputLabel) as NSString).appendingPathComponent(Self.workingDirectoryName)
+    }
+
     public func workingSegmentPath(inputLabel: String, segment: Int) -> String {
-        (inputDirectory(inputLabel: inputLabel) as NSString).appendingPathComponent("\(segmentStem(inputLabel, segment)).part.mov")
+        (workingDirectory(inputLabel: inputLabel) as NSString).appendingPathComponent("\(segmentStem(inputLabel, segment)).part.mov")
     }
 
     public func logPath(inputLabel: String, segment: Int) -> String {

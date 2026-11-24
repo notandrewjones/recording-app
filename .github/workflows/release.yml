@@ -39,7 +39,7 @@ jobs:
 
       - name: Run unit tests
         # The integration tests need real-time ffmpeg and hardware ProRes, which runner VMs lack.
-        run: swift test --package-path Packages/ISOCore --filter 'ISOCoreTests|FrameRingTests'
+        run: swift test --package-path Packages/ISOCore --filter 'ISOCoreTests|FrameRingTests|AudioTimelineTests'
 
       - name: Import Developer ID signing certificate
         env:

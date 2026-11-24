@@ -20,6 +20,13 @@ final class RecorderSink: @unchecked Sendable {
         os_unfair_lock_unlock(&lock)
         target?.ingest(frame)
     }
+
+    func send(_ audio: IngestAudio) {
+        os_unfair_lock_lock(&lock)
+        let target = recorder
+        os_unfair_lock_unlock(&lock)
+        target?.ingestAudio(audio)
+    }
 }
 
 /// What a capture thread has seen since capture last started. A session file gets a copy, so a recording
@@ -161,8 +168,12 @@ final class DeckLinkCaptureSource: CaptureSource {
                         streamTime: frame.streamTime,
                         streamTimeScale: frame.streamTimeScale,
                         timecode: timecode,
-                        hasSignal: frame.hasSignal
+                        hasSignal: frame.hasSignal,
+                        audioStreamTime: frame.hasAudioPacketTime ? frame.audioPacketTime : nil
                     ))
+                },
+                audioHandler: { sampleFrames, packetTime, timeScale, hostTime, audio in
+                    sink.send(IngestAudio(audio: audio, sampleFrames: Int(sampleFrames), streamTime: packetTime, streamTimeScale: timeScale, hostTimeNanos: hostTime))
                 },
                 formatHandler: { dlFormat in
                     format = VideoFormat(dlFormat)
@@ -272,6 +283,10 @@ final class SyntheticCaptureSource: CaptureSource {
             }
             store.offer(format: frame.format, bytes: frame.video, timecode: frame.timecode, hasSignal: frame.hasSignal)
             sink.send(frame)
+        }
+        source.onAudio = { audio in
+            guard !deliversNothing else { return }
+            sink.send(audio)
         }
         source.start()
         self.source = source

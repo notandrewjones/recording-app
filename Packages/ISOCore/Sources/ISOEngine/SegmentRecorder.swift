@@ -2,8 +2,10 @@ import Darwin
 import Foundation
 import ISOCore
 
-/// Records one segment: spawns ffmpeg for the first frame's timecode, then feeds it from the ring until
-/// the ring closes or ffmpeg dies. Everything runs on its own threads, so a stalled ffmpeg blocks nothing else.
+/// Records one segment: spawns ffmpeg for the first frame's timecode, then feeds it video from the ring and
+/// audio from the timeline until the ring closes or ffmpeg dies. Video and audio have a thread each, and
+/// neither waits on the other, because ffmpeg decides which it reads next. Everything runs on its own threads,
+/// so a stalled ffmpeg blocks nothing else.
 final class SegmentRecorder: @unchecked Sendable {
     struct Configuration {
         var number: Int
@@ -41,6 +43,8 @@ final class SegmentRecorder: @unchecked Sendable {
 
     let configuration: Configuration
     let ring: FrameRing
+    /// Nil when the input records no audio.
+    let audioTimeline: AudioTimeline?
 
     var onOpened: ((Opening) -> Void)?
     var onConnected: (() -> Void)?
@@ -52,13 +56,15 @@ final class SegmentRecorder: @unchecked Sendable {
     private var framesWritten = 0
     private var repeatedFrames = 0
     private var lastHostNanos: UInt64 = 0
+    private var audioReader: AudioTimeline.Reader?
 
     private var isAborted: Bool { lock.withLock { aborted } }
     private var usesEmbeddedTimecode: Bool { configuration.timecodeSource == .source }
 
-    init(configuration: Configuration, ring: FrameRing) {
+    init(configuration: Configuration, ring: FrameRing, audioTimeline: AudioTimeline?) {
         self.configuration = configuration
         self.ring = ring
+        self.audioTimeline = audioTimeline
     }
 
     func start() {
@@ -77,10 +83,11 @@ final class SegmentRecorder: @unchecked Sendable {
 
     /// Kills ffmpeg, which unblocks any writer stuck in a socket write.
     func kill() {
-        let running: Process? = lock.withLock {
+        let (running, reader): (Process?, AudioTimeline.Reader?) = lock.withLock {
             aborted = true
-            return process
+            return (process, audioReader)
         }
+        reader?.cancel()
         if let running, running.isRunning {
             Darwin.kill(running.processIdentifier, SIGKILL)
         }
@@ -116,29 +123,44 @@ final class SegmentRecorder: @unchecked Sendable {
             onFinished?(Outcome(framesWritten: 0, repeatedFrames: 0, exitCode: -1, neverStarted: false, drained: false))
             return
         }
-        lock.withLock { process = launched }
+        // The file's audio starts under its first picture, wherever the last segment's audio got to.
+        let firstFrame = first.metadata.timelineFrame
+        let reader = configuration.audio == nil ? nil : audioTimeline?.makeReader(startingAtFrame: firstFrame)
+        lock.withLock {
+            process = launched
+            audioReader = reader
+        }
         onOpened?(opening)
 
         let keepTrying = { [self] in launched.isRunning && !isAborted }
         let videoSocket = UnixSocketWriter()
         var drained = false
         let audioDone = DispatchSemaphore(value: 0)
-        let hasAudio = configuration.audio != nil
+        var audioStarted = false
 
         if videoSocket.connect(path: configuration.videoSocketPath, shouldContinue: keepTrying) {
             onConnected?()
-            if hasAudio {
-                startAudioThread(process: launched, done: audioDone)
+            if let reader {
+                startAudioThread(process: launched, reader: reader, done: audioDone)
+                audioStarted = true
             }
             drained = feedVideo(socket: videoSocket, startTimecode: startTimecode, process: launched)
         }
         videoSocket.close()
 
-        if !drained {
+        if drained {
+            // Audio runs to the end of the last picture, so the file's audio and video are the same length.
+            reader?.finish(atFrame: firstFrame + UInt64(counters.frames))
+        } else {
             lock.withLock { aborted = true }
+            reader?.cancel()
             if launched.isRunning { Darwin.kill(launched.processIdentifier, SIGKILL) }
         }
-        if hasAudio && videoSocket.didConnect { audioDone.wait() }
+        if audioStarted, audioDone.wait(timeout: .now() + 20) == .timedOut {
+            // ffmpeg stopped reading audio and never exited. Killing it frees the writer.
+            if launched.isRunning { Darwin.kill(launched.processIdentifier, SIGKILL) }
+            audioDone.wait()
+        }
         let exitCode = waitForExit(launched)
 
         unlink(configuration.videoSocketPath)
@@ -149,7 +171,7 @@ final class SegmentRecorder: @unchecked Sendable {
 
     private func waitForFirstFrame() -> FrameRing.Entry? {
         while !isAborted {
-            switch ring.next(.video, timeout: 0.1) {
+            switch ring.next(timeout: 0.1) {
             case .entry(let entry): return entry
             case .closed: return nil
             case .timedOut: continue
@@ -223,7 +245,7 @@ final class SegmentRecorder: @unchecked Sendable {
         }
 
         while !isAborted {
-            switch ring.next(.video, timeout: 0.1) {
+            switch ring.next(timeout: 0.1) {
             case .closed:
                 return true
             case .timedOut:
@@ -237,15 +259,15 @@ final class SegmentRecorder: @unchecked Sendable {
                 }
                 guard writeFrame(entry.video, metadata: entry.metadata, repeated: false) else { return false }
                 isFirst = false
-                ring.advance(.video)
+                ring.advance()
             }
         }
         return false
     }
 
-    private func startAudioThread(process: Process, done: DispatchSemaphore) {
+    private func startAudioThread(process: Process, reader: AudioTimeline.Reader, done: DispatchSemaphore) {
         let thread = Thread { [self] in
-            feedAudio(process: process)
+            feedAudio(process: process, reader: reader)
             done.signal()
         }
         thread.name = "segment-audio-\(configuration.number)"
@@ -254,39 +276,28 @@ final class SegmentRecorder: @unchecked Sendable {
         thread.start()
     }
 
-    private func feedAudio(process: Process) {
+    /// Sends the timeline's audio as it becomes available, and silence where the card sent none once time
+    /// has moved on, so ffmpeg is never left waiting for audio that will not come.
+    private func feedAudio(process: Process, reader: AudioTimeline.Reader) {
         guard let audio = configuration.audio else { return }
         let keepTrying = { [self] in process.isRunning && !isAborted }
         let socket = UnixSocketWriter()
         guard socket.connect(path: configuration.audioSocketPath, shouldContinue: keepTrying) else { return }
         defer { socket.close() }
 
-        let frameRate = ring.format.frameRate
         let bytesPerSample = audio.channels * 4
-        let silence = UnsafeMutableRawPointer.allocate(byteCount: ring.audioSlotBytes, alignment: 16)
-        memset(silence, 0, ring.audioSlotBytes)
-        defer { silence.deallocate() }
+        let chunkSamples = 1024
+        let chunk = UnsafeMutableRawPointer.allocate(byteCount: chunkSamples * bytesPerSample, alignment: 16)
+        defer { chunk.deallocate() }
 
-        var ordinal: UInt64 = 0
-        var isFirst = true
         while !isAborted {
-            switch ring.next(.audio, timeout: 0.1) {
-            case .closed:
+            switch reader.read(into: chunk, maxSamples: chunkSamples, timeout: 0.1) {
+            case .finished:
                 return
             case .timedOut:
                 if !process.isRunning { return }
-            case .entry(let entry):
-                if !isFirst {
-                    for _ in 0..<entry.missingBefore {
-                        let bytes = AudioCadence.sampleCount(forFrame: ordinal, frameRate: frameRate) * bytesPerSample
-                        guard socket.write(silence, count: bytes, shouldContinue: keepTrying) == .finished else { return }
-                        ordinal += 1
-                    }
-                }
-                guard socket.write(entry.audio, count: entry.audioBytes, shouldContinue: keepTrying) == .finished else { return }
-                ordinal += 1
-                isFirst = false
-                ring.advance(.audio)
+            case .samples(let count):
+                guard socket.write(chunk, count: count * bytesPerSample, shouldContinue: keepTrying) == .finished else { return }
             }
         }
     }

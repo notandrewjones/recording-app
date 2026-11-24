@@ -22,6 +22,7 @@ import Testing
             self.source = source
             let recorder = recorder
             source.onFrame = { recorder.ingest($0) }
+            source.onAudio = { recorder.ingestAudio($0) }
         }
 
         deinit {
@@ -88,6 +89,28 @@ import Testing
 
         let working = harness.session.layout.absolutePath(segment.workingFile)
         #expect(!FileManager.default.fileExists(atPath: working))
+        // Recorded out of Spotlight's sight, and the hidden folder goes once it is empty.
+        #expect(segment.workingFile == "Cam/.recording.noindex/Cam_0001.part.mov")
+        #expect(segment.finalFile == "Cam/Cam_0001.mov")
+        let input = harness.session.layout.inputDirectory(inputLabel: "Cam")
+        #expect(!FileManager.default.fileExists(atPath: (input as NSString).appendingPathComponent(SessionLayout.workingDirectoryName)))
+    }
+
+    @Test func mediaIsRecordedInAFolderSpotlightSkips() throws {
+        let harness = try Harness(environment: environment, source: SyntheticSource())
+        harness.source.start(frames: 240)
+        Thread.sleep(forTimeInterval: 0.1)
+        harness.recorder.startRecording()
+        Thread.sleep(forTimeInterval: 1.5)
+        let segment = try #require(harness.segments.first)
+        let working = harness.session.layout.absolutePath(segment.workingFile)
+        let folder = (working as NSString).deletingLastPathComponent
+        #expect((folder as NSString).lastPathComponent.hasSuffix(".noindex"))
+        #expect((folder as NSString).lastPathComponent.hasPrefix("."))
+        #expect(FileManager.default.fileExists(atPath: working))
+        harness.source.waitUntilFinished()
+        harness.finish()
+        #expect(!FileManager.default.fileExists(atPath: folder))
     }
 
     @Test func recordingArmedBeforeFramesArriveStartsAtSegmentOne() throws {
@@ -392,6 +415,90 @@ import Testing
         #expect(harness.recorder.status().problem == nil)
     }
 
+    /// The church settings of 2026-11-22: H.264 hardware, two channels.
+    static let churchH264 = LongGOPSettings(encoder: .h264Hardware, rateControl: .constantQuality(value: 60, maximumKbps: 15_000))
+
+    /// A short ring and stall timeout, so a recorder that freezes is caught and replaced within seconds.
+    static func quickStallSettings() -> InputRecorderSettings {
+        InputRecorderSettings(codec: .longGOP(churchH264), audio: AudioFormat(channels: 2), ringSeconds: 0.5, stallSeconds: 3, fullSyncSeconds: 0, slowSeconds: 1)
+    }
+
+    /// The 2026-11-22 failure. The card's audio ran short of its video. ffmpeg will not read video more than
+    /// a moment ahead of audio, and audio only arrived with frames the ring had room for, so once the ring
+    /// filled ffmpeg waited for audio that could never come, and was killed. It must record straight through.
+    @Test func audioMissingFromFramesDoesNotStallTheRecorder() throws {
+        var faults: [UInt64: SyntheticSource.Fault] = [:]
+        for frame in stride(from: UInt64(30), to: 900, by: 3) { faults[frame] = .withoutAudio }
+        let harness = try Harness(environment: environment, settings: Self.quickStallSettings(), source: SyntheticSource(audioChannels: 2, faults: faults))
+        harness.record(frames: 600)
+
+        let kinds = harness.session.store.snapshot.inputs[0].events.map(\.kind)
+        #expect(!kinds.contains("output_stuck"), "\(kinds)")
+        #expect(harness.recorder.status().restarts == 0)
+        let segments = harness.segments
+        #expect(segments.count == 1)
+        let segment = try #require(segments.first)
+        #expect(segment.state == .finalized)
+        #expect(segment.endReason == .stopped)
+        let path = harness.session.layout.absolutePath(segment.finalFile)
+        let videoSeconds = Double(segment.frames) * 1001 / 60000
+        let audio = try audioSeconds(path)
+        #expect(abs(audio - videoSeconds) < 1.0 / 59.94, "audio \(audio) s, video \(videoSeconds) s")
+        let stats = harness.recorder.status().audio
+        #expect(stats.framesWithoutAudio >= 150, "\(stats.description)")
+        #expect(kinds.contains("audio"), "the missing audio is in the session file")
+    }
+
+    /// A packet the card delivers a frame late, together with the next frame's audio, goes back under its own
+    /// picture: no silence, nothing lost, audio as long as video.
+    @Test func lateAudioPacketsLandUnderTheirOwnFrames() throws {
+        var faults: [UInt64: SyntheticSource.Fault] = [:]
+        for frame in stride(from: UInt64(30), to: 900, by: 3) { faults[frame] = .audioLate }
+        let harness = try Harness(environment: environment, settings: Self.quickStallSettings(), source: SyntheticSource(audioChannels: 2, faults: faults))
+        harness.record(frames: 600)
+        let kinds = harness.session.store.snapshot.inputs[0].events.map(\.kind)
+        #expect(!kinds.contains("output_stuck"), "\(kinds)")
+        #expect(harness.recorder.status().restarts == 0)
+        let segment = try #require(harness.segments.first)
+        #expect(harness.segments.count == 1)
+        #expect(segment.state == .finalized)
+        #expect(segment.repeatedFrames == 0)
+        let path = harness.session.layout.absolutePath(segment.finalFile)
+        let videoSeconds = Double(segment.frames) * 1001 / 60000
+        let audio = try audioSeconds(path)
+        #expect(abs(audio - videoSeconds) < 1.0 / 59.94, "audio \(audio) s, video \(videoSeconds) s")
+        let stats = harness.recorder.status().audio
+        #expect(stats.offsetPackets >= 150, "\(stats.description)")
+        #expect(stats.discontinuities == 0, "\(stats.description)")
+        #expect(stats.lateSamples == 0, "\(stats.description)")
+        // At most the last frame, if the stop came between its picture and its audio.
+        #expect(stats.silentSamples <= 801, "\(stats.description)")
+    }
+
+    /// Audio the card delivers without a picture keeps its place under the repeated frame that stands in for
+    /// the picture, so the file stays in sync.
+    @Test func audioWithoutAPictureKeepsItsPlace() throws {
+        var faults: [UInt64: SyntheticSource.Fault] = [:]
+        for frame in stride(from: UInt64(30), to: 900, by: 10) { faults[frame] = .audioOnly }
+        let harness = try Harness(environment: environment, settings: Self.quickStallSettings(), source: SyntheticSource(audioChannels: 2, faults: faults))
+        harness.record(frames: 600)
+        let kinds = harness.session.store.snapshot.inputs[0].events.map(\.kind)
+        #expect(!kinds.contains("output_stuck"), "\(kinds)")
+        let segment = try #require(harness.segments.first)
+        #expect(harness.segments.count == 1)
+        #expect(segment.state == .finalized)
+        #expect(segment.repeatedFrames >= 50)
+        let path = harness.session.layout.absolutePath(segment.finalFile)
+        let videoSeconds = Double(segment.frames) * 1001 / 60000
+        let audio = try audioSeconds(path)
+        #expect(abs(audio - videoSeconds) < 1.0 / 59.94, "audio \(audio) s, video \(videoSeconds) s")
+        let stats = harness.recorder.status().audio
+        #expect(stats.audioOnlyPackets >= 50, "\(stats.description)")
+        #expect(stats.discontinuities == 0, "\(stats.description)")
+        #expect(stats.lateSamples == 0, "\(stats.description)")
+        #expect(stats.silentSamples <= 801, "\(stats.description)")
+    }
+
     @Test func killedFFmpegRestartsIntoANewSegment() throws {
         let harness = try Harness(environment: environment, source: SyntheticSource())
         harness.source.start(frames: 360)
@@ -400,6 +507,12 @@ import Testing
         Thread.sleep(forTimeInterval: 2)
         let pid = try #require(harness.recorder.status().ffmpegProcessIdentifier)
         #expect(kill(pid, SIGKILL) == 0)
+        // One restart is enough to raise the alarm, and it stays up after recording has resumed.
+        Thread.sleep(forTimeInterval: 1.5)
+        let status = harness.recorder.status()
+        #expect(status.isWriting)
+        #expect(status.problem == .restarted(times: 1, minutes: 5))
+        #expect(status.problem?.savesNothing == false)
         harness.source.waitUntilFinished()
         Thread.sleep(forTimeInterval: 0.2)
         harness.finish()

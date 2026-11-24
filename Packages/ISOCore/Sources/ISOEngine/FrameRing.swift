@@ -50,47 +50,10 @@ public final class MemoryLockBudget: @unchecked Sendable {
     }
 }
 
-/// Fixed-memory ring between one capture thread and two writer threads, one each for video and audio.
-///
-/// Readers advance independently, so a slow audio socket does not hold up video until the ring fills.
-/// The newest frame a reader has passed stays intact, which is what the video writer repeats to fill a drop.
-/// The ring outlives a recorder crash: a new segment resumes from the first frame not yet written.
-public final class FrameRing: @unchecked Sendable {
-    public enum Reader: Int {
-        case video = 0
-        case audio = 1
-    }
-
-    public struct Metadata {
-        public var hostTimeNanos: UInt64
-        public var streamTime: Int64
-        public var timecode: Timecode?
-        public var noSignal = false
-
-        public init(hostTimeNanos: UInt64, streamTime: Int64, timecode: Timecode?) {
-            self.hostTimeNanos = hostTimeNanos
-            self.streamTime = streamTime
-            self.timecode = timecode
-        }
-    }
-
-    public struct Entry {
-        public var video: UnsafeRawPointer
-        public var audio: UnsafeRawPointer
-        public var audioBytes: Int
-        /// Frames lost immediately before this one.
-        public var missingBefore: Int
-        public var metadata: Metadata
-    }
-
-    public enum ReadResult {
-        case entry(Entry)
-        case timedOut
-        case closed
-    }
-
-    /// Whether the ring is wired into RAM. Under memory pressure macOS compresses or swaps unwired pages, and
-    /// then every frame copied in or out waits on the pager: on an 8 GB Mac that stalled capture and ffmpeg.
+/// Memory that capture writes into in real time, mapped on its own and wired into RAM when the budget allows.
+/// Under memory pressure macOS compresses or swaps unwired pages, and then every copy in or out waits on the
+/// pager: on an 8 GB Mac that stalled capture and ffmpeg.
+public final class WiredBuffer: @unchecked Sendable {
     public enum MemoryLock: Hashable, Sendable, CustomStringConvertible {
         case locked
         case overBudget
@@ -105,167 +68,208 @@ public final class FrameRing: @unchecked Sendable {
         }
     }
 
-    public let format: VideoFormat
-    public let slotCount: Int
-    public let audioSlotBytes: Int
-
+    public let pointer: UnsafeMutableRawPointer
+    public let bytes: Int
     public let memoryLock: MemoryLock
-    public let storageBytes: Int
-    private let storage: UnsafeMutableRawPointer
-    private let slotBytes: Int
     private let budget: MemoryLockBudget
-    private var metadata: [Metadata]
-    private var audioByteCounts: [Int]
-    private var missingCounts: [Int]
 
-    private let lock = UnfairLock()
-    private var head: UInt64 = 0
-    private var tails: [UInt64] = [0, 0]
-    private var closed = false
-    private var pendingMissing = 0
-    private let wakeups = [DispatchSemaphore(value: 0), DispatchSemaphore(value: 0)]
-
-    public init(format: VideoFormat, slotCount: Int, audioSlotBytes: Int, budget: MemoryLockBudget = .shared) {
-        precondition(slotCount >= 3, "A ring needs room for a held frame and two in flight")
-        self.format = format
-        self.slotCount = slotCount
-        self.audioSlotBytes = audioSlotBytes
-        slotBytes = format.frameBytes + audioSlotBytes
-        let placeholder = Metadata(hostTimeNanos: 0, streamTime: 0, timecode: nil)
-        metadata = Array(repeating: placeholder, count: slotCount)
-        audioByteCounts = Array(repeating: 0, count: slotCount)
-        missingCounts = Array(repeating: 0, count: slotCount)
+    public init(bytes: Int, budget: MemoryLockBudget) {
+        self.bytes = bytes
         self.budget = budget
-        storageBytes = slotBytes * slotCount
         // Its own mapping, so locking and unlocking it touches no page another allocation shares.
-        let mapped = mmap(nil, storageBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0)
-        precondition(mapped != MAP_FAILED, "Could not map \(storageBytes) bytes for a frame ring")
-        storage = mapped!
+        let mapped = mmap(nil, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0)
+        precondition(mapped != MAP_FAILED, "Could not map \(bytes) bytes")
+        pointer = mapped!
 
-        if !budget.reserve(storageBytes) {
+        if !budget.reserve(bytes) {
             memoryLock = .overBudget
-        } else if mlock(storage, storageBytes) == 0 {
+        } else if mlock(pointer, bytes) == 0 {
             // Wiring faults every page in, so nothing is left to fault on the capture thread.
             memoryLock = .locked
         } else {
             memoryLock = .failed(errno: errno)
-            budget.release(storageBytes)
+            budget.release(bytes)
         }
         if memoryLock != .locked {
             // Touch every page now, so the capture thread never takes a page fault on its first pass.
-            memset(storage, 0, storageBytes)
+            memset(pointer, 0, bytes)
         }
     }
 
     deinit {
         if memoryLock == .locked {
-            munlock(storage, storageBytes)
-            budget.release(storageBytes)
+            munlock(pointer, bytes)
+            budget.release(bytes)
         }
-        munmap(storage, storageBytes)
+        munmap(pointer, bytes)
+    }
+}
+
+/// Fixed-memory video ring between the capture thread and one writer thread.
+///
+/// It holds pictures only. Audio has its own buffer, `AudioTimeline`, because ffmpeg will not read video
+/// more than a moment ahead of audio: if audio could only arrive once the ring had room, a full ring would
+/// starve ffmpeg of the audio it waits for, and nothing would move again (2026-11-22).
+///
+/// Every frame offered gets a number on the input's frame timeline, `Metadata.timelineFrame`, whether the ring
+/// keeps it or drops it, and frames the card never delivered take numbers too. Audio is placed on the same
+/// timeline, which is what keeps it in step with a file that repeats frames to fill gaps.
+///
+/// The newest frame the reader has passed stays intact, which is what the writer repeats to fill a drop.
+/// The ring outlives a recorder crash: a new segment resumes from the first frame not yet written.
+public final class FrameRing: @unchecked Sendable {
+    public typealias MemoryLock = WiredBuffer.MemoryLock
+
+    public struct Metadata {
+        public var hostTimeNanos: UInt64
+        public var streamTime: Int64
+        public var timecode: Timecode?
+        public var noSignal = false
+        /// This frame's place on the input's frame timeline. Set by `push`.
+        public var timelineFrame: UInt64 = 0
+
+        public init(hostTimeNanos: UInt64, streamTime: Int64, timecode: Timecode?) {
+            self.hostTimeNanos = hostTimeNanos
+            self.streamTime = streamTime
+            self.timecode = timecode
+        }
+    }
+
+    public struct Entry {
+        public var video: UnsafeRawPointer
+        /// Frames lost immediately before this one.
+        public var missingBefore: Int
+        public var metadata: Metadata
+    }
+
+    public struct PushResult {
+        /// False when the ring was full or closed. The frame is then counted as missing.
+        public var accepted: Bool
+        /// The frame's number on the timeline, assigned whether or not it was kept.
+        public var timelineFrame: UInt64
+    }
+
+    public enum ReadResult {
+        case entry(Entry)
+        case timedOut
+        case closed
+    }
+
+    public let format: VideoFormat
+    public let slotCount: Int
+
+    public var memoryLock: MemoryLock { buffer.memoryLock }
+    public var storageBytes: Int { buffer.bytes }
+    private let buffer: WiredBuffer
+    private let slotBytes: Int
+    private var metadata: [Metadata]
+    private var missingCounts: [Int]
+
+    private let lock = UnfairLock()
+    private var head: UInt64 = 0
+    private var tail: UInt64 = 0
+    private var closed = false
+    private var pendingMissing = 0
+    private var nextTimelineFrame: UInt64 = 0
+    private let wakeup = DispatchSemaphore(value: 0)
+
+    public init(format: VideoFormat, slotCount: Int, budget: MemoryLockBudget = .shared) {
+        precondition(slotCount >= 3, "A ring needs room for a held frame and two in flight")
+        self.format = format
+        self.slotCount = slotCount
+        slotBytes = format.frameBytes
+        let placeholder = Metadata(hostTimeNanos: 0, streamTime: 0, timecode: nil)
+        metadata = Array(repeating: placeholder, count: slotCount)
+        missingCounts = Array(repeating: 0, count: slotCount)
+        buffer = WiredBuffer(bytes: slotBytes * slotCount, budget: budget)
     }
 
     private func slotPointer(_ position: UInt64) -> UnsafeMutableRawPointer {
-        storage.advanced(by: Int(position % UInt64(slotCount)) * slotBytes)
+        buffer.pointer.advanced(by: Int(position % UInt64(slotCount)) * slotBytes)
     }
 
-    /// Capture thread. Returns false when the ring is full, and the frame is then counted as missing.
+    /// Capture thread. A frame the ring has no room for is counted as missing, and the writer repeats the
+    /// previous frame in its place.
     @discardableResult
-    public func push(video: UnsafeRawPointer, audio: UnsafeRawPointer?, audioBytes: Int, metadata entry: Metadata) -> Bool {
-        let reservation: UInt64? = lock.withLock {
-            guard !closed else { return nil }
-            let oldest = min(tails[0], tails[1])
+    public func push(video: UnsafeRawPointer, metadata entry: Metadata) -> PushResult {
+        let (reservation, timelineFrame): (UInt64?, UInt64) = lock.withLock {
+            let frame = nextTimelineFrame
+            nextTimelineFrame += 1
+            guard !closed else { return (nil, frame) }
             // One slot stays back so the previous frame survives for repeating.
-            guard head - oldest < UInt64(slotCount - 1) else {
+            guard head - tail < UInt64(slotCount - 1) else {
                 pendingMissing += 1
-                return nil
+                return (nil, frame)
             }
-            return head
+            return (head, frame)
         }
-        guard let position = reservation else { return false }
+        guard let position = reservation else { return PushResult(accepted: false, timelineFrame: timelineFrame) }
 
-        let slot = slotPointer(position)
-        slot.copyMemory(from: video, byteCount: format.frameBytes)
-        let audioCount = min(audioBytes, audioSlotBytes)
-        let audioSlot = slot.advanced(by: format.frameBytes)
-        if let audio {
-            audioSlot.copyMemory(from: audio, byteCount: audioCount)
-        } else {
-            memset(audioSlot, 0, audioCount)
-        }
+        slotPointer(position).copyMemory(from: video, byteCount: format.frameBytes)
 
         let index = Int(position % UInt64(slotCount))
+        var stamped = entry
+        stamped.timelineFrame = timelineFrame
         lock.withLock {
-            metadata[index] = entry
-            audioByteCounts[index] = audioCount
+            metadata[index] = stamped
             missingCounts[index] = pendingMissing
             pendingMissing = 0
             head = position + 1
         }
-        wakeups[0].signal()
-        wakeups[1].signal()
-        return true
+        wakeup.signal()
+        return PushResult(accepted: true, timelineFrame: timelineFrame)
     }
 
-    /// Capture thread. Records frames the source never delivered, so the next frame carries the gap.
+    /// Capture thread. Records frames the source never delivered, so the next frame carries the gap and the
+    /// timeline keeps a place for each of them.
     public func markMissing(_ count: Int) {
-        lock.withLock { pendingMissing += count }
+        guard count > 0 else { return }
+        lock.withLock {
+            pendingMissing += count
+            nextTimelineFrame += UInt64(count)
+        }
     }
 
     /// Writer thread. Returns the next unread frame without consuming it.
-    public func next(_ reader: Reader, timeout: TimeInterval) -> ReadResult {
+    public func next(timeout: TimeInterval) -> ReadResult {
         let deadline = DispatchTime.now() + timeout
         while true {
             let result: ReadResult? = lock.withLock {
-                let tail = tails[reader.rawValue]
                 if tail < head {
                     let index = Int(tail % UInt64(slotCount))
-                    let slot = slotPointer(tail)
-                    return .entry(Entry(
-                        video: UnsafeRawPointer(slot),
-                        audio: UnsafeRawPointer(slot.advanced(by: format.frameBytes)),
-                        audioBytes: audioByteCounts[index],
-                        missingBefore: missingCounts[index],
-                        metadata: metadata[index]
-                    ))
+                    return .entry(Entry(video: UnsafeRawPointer(slotPointer(tail)), missingBefore: missingCounts[index], metadata: metadata[index]))
                 }
                 return closed ? .closed : nil
             }
             if let result { return result }
-            if wakeups[reader.rawValue].wait(timeout: deadline) == .timedOut { return .timedOut }
+            if wakeup.wait(timeout: deadline) == .timedOut { return .timedOut }
         }
     }
 
-    public func advance(_ reader: Reader) {
-        lock.withLock { tails[reader.rawValue] += 1 }
+    public func advance() {
+        lock.withLock { tail += 1 }
     }
 
-    /// The frame most recently passed by the video reader, for repeating into a gap.
+    /// The frame most recently passed by the reader, for repeating into a gap.
     public var previousVideoFrame: UnsafeRawPointer? {
         lock.withLock {
-            tails[0] == 0 ? nil : UnsafeRawPointer(slotPointer(tails[0] - 1))
+            tail == 0 ? nil : UnsafeRawPointer(slotPointer(tail - 1))
         }
-    }
-
-    /// Lines audio up with video after a crash, when the readers will have stopped at different frames.
-    public func alignAudioToVideo() {
-        lock.withLock { tails[1] = tails[0] }
     }
 
     public func close() {
         lock.withLock { closed = true }
-        wakeups[0].signal()
-        wakeups[1].signal()
+        wakeup.signal()
     }
 
     public var isClosed: Bool { lock.withLock { closed } }
 
     /// How much of the ring is occupied, from 0 to 1. Rising fill is the first sign of an encoder falling behind.
     public var fillLevel: Double {
-        lock.withLock { Double(head - min(tails[0], tails[1])) / Double(slotCount - 1) }
+        lock.withLock { Double(head - tail) / Double(slotCount - 1) }
     }
 
     public var queuedFrames: Int {
-        lock.withLock { Int(head - tails[0]) }
+        lock.withLock { Int(head - tail) }
     }
 }

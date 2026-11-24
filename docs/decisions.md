@@ -366,3 +366,85 @@ reports the 10-bit signal as a format change after every frame while the input i
   `NotWritingReason` became `RecordingProblem`, since this one is not about writing.
 - **The report fails it.** rc3 passed the storm session. Now an `unstable` event fails, and so do five or
   more files under a second long in one input, for sessions recorded before the event existed.
+
+## Audio has its own buffer, placed by the card's timestamps
+
+The 2026-11-22 service (`2026-11-22_105900`, rc4, H.264 hardware, two channels) restarted ffmpeg 81 and 77
+times. Each restart followed `output_slow ring 100%` and `output_stuck`, with ffmpeg using no CPU. Files
+that stopped cleanly were 0.8 to 0.9 s shorter in audio than in video. A healthy file matches to the
+microsecond. The fault was ours, in how audio reached ffmpeg. ffmpeg was not at fault.
+
+- **The deadlock.** ffmpeg's scheduler will not read video more than about 0.1 s ahead of audio. Audio only
+  arrived with frames that had a ring slot, and a frame with no audio packet wrote no audio. Once audio ran
+  short, ffmpeg read video slightly slower than real time and the ring filled. A full ring then took no
+  new frames, so no new audio either. ffmpeg waited for audio that could never come, and the stall detector
+  killed it 10 seconds later. A synthetic source that drops the audio from one frame in 60 reproduced it
+  exactly, and a slow encoder on its own does not: x265 at 46 fps and six H.264 inputs both ran with full
+  rings and no freeze.
+- **The trigger** was `mediaanalysisd` running its hour-long `filesystem.video` maintenance task. It starts
+  once the Mac is idle with the display off. Every restart happened while it ran, and none in the five
+  minutes between runs. It made the encoder slow enough for the ring to fill. It did not cause the freeze.
+- **`FrameRing` holds video only, and `AudioTimeline` holds audio.** Both share one frame timeline: every
+  frame offered gets a number, including frames the ring drops and frames that never arrived. Audio is
+  written to the timeline as it arrives, whether or not the ring has room, and the writer reads it on its
+  own thread. Once the newest frame is four frames past, the writer sends silence wherever no audio came.
+  So ffmpeg can always get the audio it needs to keep reading video. Fifteen seconds are kept, enough for
+  a frozen recorder to be replaced with the audio for the frames it carries over still there.
+- **Placement uses `GetPacketTime`.** A packet is placed by its time relative to the frame it came with,
+  so a packet delivered a frame late lands under its own picture. Audio that arrives with no frame, which
+  the bridge used to drop, is placed against the newest frame. A packet within 10 ms of where the last one
+  ended follows straight on from it, because the card's 800 and 801 sample cadence need not line up with
+  ours. Placing each packet exactly clicked once every five frames.
+- **Silence is the counterpart of a repeated frame.** Where the card sent no audio there is nothing to
+  put, but a MOV needs continuous audio, so the gap holds silence of exactly its length. A file's audio
+  and video end together because the writer stops at the timeline position of the last picture.
+- **One restart raises the alarm.** rc4 waited for five restarts in ten seconds, so 160 restarts across
+  four hours never alerted anyone. Now any recorder restart while recording raises
+  `RecordingProblem.restarted` for five minutes. The tile shows RESTARTED and the Basso alert fires once.
+- **What the card's audio did goes in the session file.** An `audio` event every minute reports any frames
+  without audio, audio-only packets, packets timed apart from their frame, discontinuities and silence.
+  The card's own capture line now counts frames without audio and audio-only packets as well.
+
+## Recording keeps the Mac awake and the user active
+
+The trigger of 2026-11-22 needed an idle Mac. Jump Desktop's "user is active" assertions timed out, the
+display went off at 11:17:44, and `dasd` started `mediaanalysisd`'s `filesystem.video` at 11:19:34. App
+Nap was active on the app as well. From Record to Stop the app now holds a `SystemActivity`. It has three
+parts, each named "ISO Recorder is recording" in `pmset -g assertions`:
+
+- **`PreventUserIdleSystemSleep`** and **`PreventUserIdleDisplaySleep`**, from a `ProcessInfo` activity
+  with `.userInitiated`, `.idleDisplaySleepDisabled` and `.latencyCritical`. This also turns App Nap off.
+- **`UserIsActive`**, from `IOPMAssertionDeclareUserActivity`, renewed every 30 seconds. A declaration
+  lasts 30 minutes here, but that may differ between Macs. Keeping the display awake is not the same as
+  the user being active, and idle maintenance waits for the user. Jump Desktop held this kind of
+  assertion, and the task started two minutes after it lapsed.
+
+The display stays on and the screen does not lock while recording. That is deliberate: an operator coming
+back to the Mac sees any alarm at once. After Stop, only `PreventUserIdleSystemSleep` ("ISO Recorder is
+finishing recordings") is held until every file is finalized, then nothing. `isorec record` does the same,
+so soak runs match the app. If declaring the user active ever fails, each input gets a
+`keep_awake_failed` event.
+
+## Media is recorded in a hidden folder Spotlight skips
+
+The other half of the 2026-11-22 trigger was the recordings themselves. Each working `.part.mov` grows for
+hours, and Spotlight re-imports a file as it changes and offers new video to media analysis. Tested on this
+macOS by writing marked files and asking `mdfind` for them:
+
+| Folder | Indexed |
+|---|---|
+| Plain folder | Yes |
+| Folder holding a `.metadata_never_index` file, and its subfolder | Yes, both |
+| Folder named `named.noindex`, and its subfolder | No |
+| Hidden folder `.anything` | No |
+
+So a `.metadata_never_index` file does nothing for a folder, whatever older advice says, and only the name
+counts. Renaming session or input folders to `.noindex` would show in Finder and in every editor's media
+browser. Instead, working files are recorded in `<input>/.recording.noindex/`, which is both hidden and
+`.noindex`. The finished `<input>_0001.mov` is written beside it, as before, and indexed once. During a
+25-second `isorec` recording into `~/Movies`, Spotlight never found the growing 70 MB `.part.mov`, and found
+the finished `.mov` straight after.
+
+The folder is removed once its last segment is finalized. A segment that cannot be finalized is moved up into
+`<input>/`, and `session.json` follows it, because that working file is the only copy and must not be hidden.
+Sessions recorded before this change keep their stored paths and still finalize and export as they did.

@@ -10,6 +10,10 @@
 struct DLCaptureStats {
     std::atomic<uint64_t> frameCallbacks{0};
     std::atomic<uint64_t> unreadableFrames{0};
+    /// Frames that came with no audio packet while audio was enabled.
+    std::atomic<uint64_t> framesWithoutAudio{0};
+    /// Audio packets that came with no frame.
+    std::atomic<uint64_t> audioOnlyPackets{0};
     std::atomic<uint64_t> formatChanges{0};
     /// Format changes that reconfigured the input. The rest were left alone.
     std::atomic<uint64_t> reconfigurations{0};
@@ -21,6 +25,8 @@ struct DLCaptureStats {
     void reset() {
         frameCallbacks = 0;
         unreadableFrames = 0;
+        framesWithoutAudio = 0;
+        audioOnlyPackets = 0;
         formatChanges = 0;
         reconfigurations = 0;
         std::lock_guard<std::mutex> guard(lastChangeLock);
@@ -54,8 +60,8 @@ static DLFormat DLFormatFromMode(IDeckLinkDisplayMode *mode) {
 
 class DLInputCallback final : public IDeckLinkInputCallback {
 public:
-    DLInputCallback(IDeckLinkInput *input, BMDDisplayMode mode, BMDPixelFormat pixelFormat, DLCaptureStats *stats, DLFrameHandler frameHandler, DLFormatHandler formatHandler)
-        : input_(input), mode_(mode), pixelFormat_(pixelFormat), stats_(stats), frameHandler_(frameHandler), formatHandler_(formatHandler) {}
+    DLInputCallback(IDeckLinkInput *input, BMDDisplayMode mode, BMDPixelFormat pixelFormat, bool audioEnabled, DLCaptureStats *stats, DLFrameHandler frameHandler, DLAudioHandler audioHandler, DLFormatHandler formatHandler)
+        : input_(input), mode_(mode), pixelFormat_(pixelFormat), audioEnabled_(audioEnabled), stats_(stats), frameHandler_(frameHandler), audioHandler_(audioHandler), formatHandler_(formatHandler) {}
 
     HRESULT QueryInterface(REFIID, LPVOID *ppv) override {
         *ppv = nullptr;
@@ -94,9 +100,21 @@ public:
     }
 
     HRESULT VideoInputFrameArrived(IDeckLinkVideoInputFrame *frame, IDeckLinkAudioInputPacket *audio) override {
-        if (frame == nullptr) return S_OK;
         const uint64_t hostTime = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (frame == nullptr) {
+            // The card had no frame buffer free, but the audio still came. It is the only copy, so it is kept.
+            void *audioBytes = nullptr;
+            if (audio != nullptr && audio->GetBytes(&audioBytes) == S_OK && audioBytes != nullptr) {
+                stats_->audioOnlyPackets++;
+                BMDTimeValue packetTime = 0;
+                if (audio->GetPacketTime(&packetTime, kStreamTimeScale) == S_OK) {
+                    audioHandler_((int32_t)audio->GetSampleFrameCount(), packetTime, kStreamTimeScale, hostTime, audioBytes);
+                }
+            }
+            return S_OK;
+        }
         stats_->frameCallbacks++;
+        if (audioEnabled_ && audio == nullptr) stats_->framesWithoutAudio++;
 
         IDeckLinkVideoBuffer *buffer = nullptr;
         if (frame->QueryInterface(IID_IDeckLinkVideoBuffer, (void **)&buffer) != S_OK) {
@@ -116,7 +134,7 @@ public:
                 info.hasSignal = (frame->GetFlags() & bmdFrameHasNoInputSource) == 0;
                 info.isTenBit = frame->GetPixelFormat() == bmdFormat10BitYUV;
                 info.hostTimeNanos = hostTime;
-                info.streamTimeScale = 240000;
+                info.streamTimeScale = kStreamTimeScale;
                 BMDTimeValue duration = 0;
                 BMDTimeValue streamTime = 0;
                 frame->GetStreamTime(&streamTime, &duration, info.streamTimeScale);
@@ -126,6 +144,11 @@ public:
                 void *audioBytes = nullptr;
                 if (audio != nullptr && audio->GetBytes(&audioBytes) == S_OK) {
                     info.audioSampleFrames = (int32_t)audio->GetSampleFrameCount();
+                    BMDTimeValue packetTime = 0;
+                    if (audio->GetPacketTime(&packetTime, info.streamTimeScale) == S_OK) {
+                        info.hasAudioPacketTime = true;
+                        info.audioPacketTime = packetTime;
+                    }
                 }
                 frameHandler_(&info, videoBytes, audioBytes);
             }
@@ -137,6 +160,9 @@ public:
     }
 
 private:
+    /// Divides evenly into every supported frame rate's frame duration.
+    static constexpr BMDTimeScale kStreamTimeScale = 240000;
+
     static void readTimecode(IDeckLinkVideoInputFrame *frame, DLFrameInfo *info) {
         IDeckLinkTimecode *timecode = nullptr;
         if (frame->GetTimecode(bmdTimecodeRP188Any, &timecode) != S_OK || timecode == nullptr) {
@@ -152,8 +178,10 @@ private:
     /// The mode the input is enabled in. Only touched on the SDK's callback thread after construction.
     BMDDisplayMode mode_;
     const BMDPixelFormat pixelFormat_;
+    const bool audioEnabled_;
     DLCaptureStats *stats_;
     DLFrameHandler frameHandler_;
+    DLAudioHandler audioHandler_;
     DLFormatHandler formatHandler_;
 };
 
@@ -227,10 +255,12 @@ private:
 - (NSString *)captureStatsDescription {
     const uint64_t callbacks = _stats->frameCallbacks;
     const uint64_t unreadable = _stats->unreadableFrames;
+    const uint64_t withoutAudio = _stats->framesWithoutAudio;
+    const uint64_t audioOnly = _stats->audioOnlyPackets;
     const uint64_t changes = _stats->formatChanges;
     const uint64_t reconfigurations = _stats->reconfigurations;
-    NSMutableString *text = [NSMutableString stringWithFormat:@"%llu frame callbacks, %llu unreadable, %llu format change%@, %llu reconfigured",
-        callbacks, unreadable, changes, changes == 1 ? @"" : @"s", reconfigurations];
+    NSMutableString *text = [NSMutableString stringWithFormat:@"%llu frame callbacks, %llu unreadable, %llu without audio, %llu audio only, %llu format change%@, %llu reconfigured",
+        callbacks, unreadable, withoutAudio, audioOnly, changes, changes == 1 ? @"" : @"s", reconfigurations];
     if (changes == 0) return text;
 
     DLFormat format;
@@ -265,6 +295,7 @@ private:
 
 - (BOOL)startWithAudioChannels:(int32_t)audioChannels
                   frameHandler:(DLFrameHandler)frameHandler
+                  audioHandler:(DLAudioHandler)audioHandler
                  formatHandler:(DLFormatHandler)formatHandler
                          error:(NSError **)error {
     [self stop];
@@ -288,7 +319,7 @@ private:
         }
     }
 
-    _callback = new DLInputCallback(_input, initialMode, pixelFormat, _stats, frameHandler, formatHandler);
+    _callback = new DLInputCallback(_input, initialMode, pixelFormat, audioChannels > 0, _stats, frameHandler, audioHandler, formatHandler);
     _input->SetCallback(_callback);
     result = _input->StartStreams();
     if (result != S_OK) {

@@ -17,7 +17,7 @@ import Testing
         init(environment: FFmpegEnvironment, seconds: Int = 4) throws {
             root = (NSTemporaryDirectory() as NSString).appendingPathComponent("isorec-salvage-\(UUID().uuidString)")
             layout = SessionLayout(rootPath: root, sessionName: "salvage")
-            try FileManager.default.createDirectory(atPath: layout.inputDirectory(inputLabel: "Cam"), withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(atPath: layout.workingDirectory(inputLabel: "Cam"), withIntermediateDirectories: true)
             var record = SessionManifest.SegmentRecord(
                 number: 1,
                 workingFile: layout.relativePath(layout.workingSegmentPath(inputLabel: "Cam", segment: 1)),
@@ -152,6 +152,8 @@ import Testing
         let leftovers = try FileManager.default.contentsOfDirectory(atPath: fixture.layout.inputDirectory(inputLabel: "Cam"))
         #expect(!leftovers.contains { $0.contains("salvage") })
         #expect(!FileManager.default.fileExists(atPath: fixture.working))
+        // The salvage copy sat in the hidden working folder too, and both are gone.
+        #expect(!FileManager.default.fileExists(atPath: fixture.layout.workingDirectory(inputLabel: "Cam")))
     }
 
     @Test func unreadableRecordingSaysWhy() throws {
@@ -161,6 +163,10 @@ import Testing
         let segment = try fixture.recover(environment: environment)
         #expect(segment.state == .finalizeFailed)
         #expect(segment.finalizeError?.hasPrefix("could not read the recording") == true)
-        #expect(FileManager.default.fileExists(atPath: fixture.working))
+        // The only copy is moved where it can be seen, and the session file follows it.
+        #expect(!FileManager.default.fileExists(atPath: fixture.working))
+        #expect(segment.workingFile == "Cam/Cam_0001.part.mov")
+        #expect(FileManager.default.fileExists(atPath: fixture.layout.absolutePath(segment.workingFile)))
+        #expect(!FileManager.default.fileExists(atPath: fixture.layout.workingDirectory(inputLabel: "Cam")))
     }
 }

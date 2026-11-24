@@ -101,10 +101,11 @@ Every frame gets one 32-byte `.idx` record: frame number, host time, stream time
 
 ## Files
 
-One fragmented `<input>_0001.part.mov` per segment, with 0.5 s fragments. When a segment closes, the
-finalizer remuxes it losslessly to `<input>_0001.mov`, checks the frame count matches, and only then deletes
-the working file. If that fails or there is not enough disk, the working file stays and is marked in
-`session.json`. Every 2 s the working file and index are flushed to the drive with `F_FULLFSYNC`.
+One fragmented `<input>_0001.part.mov` per segment, with 0.5 s fragments, recorded in the hidden
+`<input>/.recording.noindex/` folder so Spotlight leaves it alone. When a segment closes, the finalizer
+remuxes it losslessly to `<input>_0001.mov` beside that folder, checks the frame count matches, and only then
+deletes the working file and the folder. If that fails or there is not enough disk, the working file is moved
+up into `<input>/`, where it can be seen, and marked in `session.json`. Every 2 s the working file and index are flushed to the drive with `F_FULLFSYNC`.
 
 Each segment also has an `.idx` and an ffmpeg `.log`. `session.json` is replaced atomically on each change.
 

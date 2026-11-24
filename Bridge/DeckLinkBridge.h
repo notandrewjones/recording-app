@@ -34,10 +34,17 @@ typedef struct {
     uint8_t timecodeSeconds;
     uint8_t timecodeFrames;
     int32_t audioSampleFrames;
+    /// When the audio packet's first sample was captured, on the same clock and scale as `streamTime`. The
+    /// card stamps audio separately, and a packet need not start with the frame it arrives with.
+    bool hasAudioPacketTime;
+    int64_t audioPacketTime;
 } DLFrameInfo;
 
 /// Called on the SDK's capture thread. Pointers are valid only during the call. Must never block.
 typedef void (^DLFrameHandler)(const DLFrameInfo *info, const void *videoBytes, const void *_Nullable audioBytes);
+/// Audio the card delivered without a picture, which it does when it had no frame buffer free. Called on the
+/// SDK's capture thread. `packetTime` is on the video stream clock, at `timeScale`. Must never block.
+typedef void (^DLAudioHandler)(int32_t sampleFrames, int64_t packetTime, int64_t timeScale, uint64_t hostTimeNanos, const void *audioBytes);
 /// Called on the SDK's capture thread after the input has been reconfigured for the new format.
 typedef void (^DLFormatHandler)(DLFormat format);
 
@@ -50,7 +57,7 @@ typedef void (^DLFormatHandler)(DLFormat format);
 /// v210 when YES (the default), 8-bit UYVY when NO. Takes effect at the next start.
 @property (nonatomic) BOOL captureTenBit;
 /// What the card has done since capture last started, in one line for a session file, such as
-/// "3600 frame callbacks, 0 unreadable, 1 format change, 1 reconfigured (last: 1920x1080 at 59.94 interlaced; mode changed; YCbCr 4:2:2 10-bit)".
+/// "3600 frame callbacks, 0 unreadable, 0 without audio, 0 audio only, 1 format change, 1 reconfigured (last: 1920x1080 at 59.94 interlaced; mode changed; YCbCr 4:2:2 10-bit)".
 /// It covers frames that never reach the frame handler, which is the only way to tell a silent card from one
 /// whose frames are being dropped.
 @property (nonatomic, readonly) NSString *captureStatsDescription;
@@ -59,6 +66,7 @@ typedef void (^DLFormatHandler)(DLFormat format);
 /// otherwise it stays at 1080p59.94.
 - (BOOL)startWithAudioChannels:(int32_t)audioChannels
                   frameHandler:(DLFrameHandler)frameHandler
+                  audioHandler:(DLAudioHandler)audioHandler
                  formatHandler:(DLFormatHandler)formatHandler
                          error:(NSError **)error;
 - (void)stop;

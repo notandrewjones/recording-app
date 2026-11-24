@@ -581,7 +581,7 @@ struct InputTileView: View {
         if let error = tile.errorMessage { return error }
         // Before the signal states: a card that stops sending leaves its last picture and "locked" behind.
         if let reason = tile.problem {
-            return "\(reason.savesNothing ? "NOT RECORDING" : "UNSTABLE"): \(reason.description.uppercased())"
+            return "\(reason.chipText): \(reason.description.uppercased())"
         }
         switch tile.status.signal {
         case .noSignal: return "NO SIGNAL"
@@ -614,7 +614,7 @@ struct InputTileView: View {
             // Armed is the normal state, so only the exceptions are labelled. REC means a file is being
             // written and nothing is wrong with it.
             if let problem = tile.problem {
-                StateChip(text: problem.savesNothing ? "NOT RECORDING" : "UNSTABLE", foreground: .black, fill: Palette.warning)
+                StateChip(text: problem.chipText, foreground: .black, fill: Palette.warning)
             } else if tile.isWriting {
                 StateChip(text: "REC", foreground: .white, fill: Palette.tally)
             } else if tile.isInSession {

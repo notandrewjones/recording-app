@@ -13,6 +13,14 @@ public final class SyntheticSource: @unchecked Sendable {
         case stopDelivering(seconds: Double)
         /// Stream time starts again from zero and this many frames are lost, as when a card restarts its input.
         case restartClock(lostFrames: Int)
+        /// This frame arrives with no audio packet and its audio is lost, as when a card's packet goes missing.
+        case withoutAudio
+        /// This frame arrives with no audio packet. Its audio comes with the next frame, in one packet that holds
+        /// both frames' samples and carries this frame's time.
+        case audioLate
+        /// This frame's picture never arrives, but its audio does, on its own, as when the card has no buffer
+        /// free for the picture.
+        case audioOnly
     }
 
     public static let streamTimeScale: Int64 = 240_000
@@ -30,6 +38,8 @@ public final class SyntheticSource: @unchecked Sendable {
 
     /// Sends one frame to whatever is consuming this source.
     public var onFrame: ((IngestFrame) -> Void)?
+    /// Sends audio that arrived without a picture. Only the `audioOnly` fault uses it.
+    public var onAudio: ((IngestAudio) -> Void)?
 
     /// - Parameter faults: keyed by delivered frame number.
     public init(format: VideoFormat = .hd1080p5994, audioChannels: Int = 16, timecodeStart: Timecode? = nil, faults: [UInt64: Fault] = [:], realtime: Bool = true, pool: SyntheticFramePool? = nil) {
@@ -73,6 +83,9 @@ public final class SyntheticSource: @unchecked Sendable {
         var noSignalRemaining = 0
         var samplePhase = 0
         var nextDue = DispatchTime.now().uptimeNanoseconds
+        // Samples held back by `audioLate`, at the start of `audio`, and the stream time of the first of them.
+        var carriedSamples = 0
+        var carriedTime: Int64 = 0
 
         while delivered < limit, !lock.withLock({ cancelled }) {
             if let fault = faults[delivered] {
@@ -104,6 +117,9 @@ public final class SyntheticSource: @unchecked Sendable {
                         let now = DispatchTime.now().uptimeNanoseconds
                         if nextDue > now { usleep(UInt32((nextDue - now) / 1000)) }
                     }
+                case .withoutAudio, .audioLate, .audioOnly:
+                    // Handled with the frame's audio below.
+                    break
                 }
             }
 
@@ -115,22 +131,53 @@ public final class SyntheticSource: @unchecked Sendable {
                 video = UnsafeRawPointer(buffer.baseAddress!)
             }
             let samples = AudioCadence.sampleCount(forFrame: cadenceFrame, frameRate: format.frameRate)
+            let bytesPerSample = max(audioChannels, 1) * 4
             if audioChannels > 0 {
-                Self.fillTone(audio, samples: samples, channels: audioChannels, phase: &samplePhase)
+                Self.fillTone(audio.advanced(by: carriedSamples * bytesPerSample), samples: samples, channels: audioChannels, phase: &samplePhase)
+            }
+            let audioFault = faults[delivered]
+            let packetTime = carriedSamples > 0 ? carriedTime : streamTicks
+            let packetSamples = carriedSamples + samples
+            var frameAudio = audioChannels > 0
+            switch audioFault {
+            case .withoutAudio?:
+                frameAudio = false
+                carriedSamples = 0
+            case .audioLate?:
+                frameAudio = false
+                if carriedSamples == 0 { carriedTime = streamTicks }
+                carriedSamples += samples
+            case .audioOnly?:
+                frameAudio = false
+                carriedSamples = 0
+                if audioChannels > 0 {
+                    onAudio?(IngestAudio(
+                        audio: UnsafeRawPointer(audio),
+                        sampleFrames: packetSamples,
+                        streamTime: packetTime,
+                        streamTimeScale: Self.streamTimeScale,
+                        hostTimeNanos: DispatchTime.now().uptimeNanoseconds
+                    ))
+                }
+            default:
+                carriedSamples = 0
             }
 
-            let frame = IngestFrame(
-                format: format,
-                video: video,
-                audio: audioChannels > 0 ? UnsafeRawPointer(audio) : nil,
-                audioSampleFrames: audioChannels > 0 ? samples : 0,
-                hostTimeNanos: DispatchTime.now().uptimeNanoseconds,
-                streamTime: streamTicks,
-                streamTimeScale: Self.streamTimeScale,
-                timecode: timecodeStart?.advanced(by: Int(cadenceFrame)),
-                hasSignal: noSignalRemaining == 0
-            )
-            onFrame?(frame)
+            if audioFault != .audioOnly {
+                let frame = IngestFrame(
+                    format: format,
+                    video: video,
+                    audio: frameAudio ? UnsafeRawPointer(audio) : nil,
+                    audioSampleFrames: frameAudio ? packetSamples : 0,
+                    hostTimeNanos: DispatchTime.now().uptimeNanoseconds,
+                    streamTime: streamTicks,
+                    streamTimeScale: Self.streamTimeScale,
+                    timecode: timecodeStart?.advanced(by: Int(cadenceFrame)),
+                    hasSignal: noSignalRemaining == 0,
+                    audioStreamTime: frameAudio ? packetTime : nil
+                )
+                onFrame?(frame)
+            }
 
             if noSignalRemaining > 0 { noSignalRemaining -= 1 }
             delivered += 1

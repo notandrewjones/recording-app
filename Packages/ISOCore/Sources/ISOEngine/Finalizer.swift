@@ -42,11 +42,19 @@ public final class Finalizer: @unchecked Sendable {
         var salvage: String?
         defer {
             if let salvage { unlink(salvage) }
+            // An unfinished recording is the only copy, so it must not stay hidden.
+            var shown: String?
+            if state == .finalized {
+                Self.removeWorkingDirectoryIfEmpty(containing: working)
+            } else {
+                shown = Self.moveOutOfWorkingDirectory(working)
+            }
             store.updateSegment(inputID: inputID, number: number) {
                 $0.state = state
                 $0.frames = frames
                 $0.lostFrames = lost
                 $0.finalizeError = failure
+                if let shown { $0.workingFile = store.layout.relativePath(shown) }
             }
         }
 
@@ -102,6 +110,27 @@ public final class Finalizer: @unchecked Sendable {
         }
         unlink(working)
         state = .finalized
+    }
+
+    /// Moves a working file that could not be finished from the hidden working folder into its input folder,
+    /// where it can be seen. Returns its new path, or nil if it was not in the working folder or could not move.
+    static func moveOutOfWorkingDirectory(_ path: String) -> String? {
+        let directory = (path as NSString).deletingLastPathComponent
+        guard (directory as NSString).lastPathComponent == SessionLayout.workingDirectoryName,
+              FileManager.default.fileExists(atPath: path) else { return nil }
+        let destination = ((directory as NSString).deletingLastPathComponent as NSString).appendingPathComponent((path as NSString).lastPathComponent)
+        guard !FileManager.default.fileExists(atPath: destination), rename(path, destination) == 0 else { return nil }
+        removeWorkingDirectoryIfEmpty(containing: path)
+        return destination
+    }
+
+    /// Removes the hidden working folder once its last recording is finished, so a session folder copied to
+    /// an editor holds only what it shows. Sessions from before the folder existed are left alone.
+    static func removeWorkingDirectoryIfEmpty(containing path: String) {
+        let directory = (path as NSString).deletingLastPathComponent
+        guard (directory as NSString).lastPathComponent == SessionLayout.workingDirectoryName else { return }
+        // Fails, harmlessly, while another segment is still in it.
+        rmdir(directory)
     }
 
     /// A hidden copy of `path` cut back to its last complete fragment, or nil if cutting would not help.

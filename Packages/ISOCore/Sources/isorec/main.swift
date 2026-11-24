@@ -99,6 +99,7 @@ case "record":
         let recorder = session.addInput(id: "synthetic-\(index)", label: "Cam \(index)", settings: settings)
         let source = SyntheticSource(audioChannels: audioChannels, pool: pool)
         source.onFrame = { recorder.ingest($0) }
+        source.onAudio = { recorder.ingestAudio($0) }
         source.start()
         sources.append(source)
         recorders.append(recorder)
@@ -111,6 +112,8 @@ case "record":
             Thread.sleep(forTimeInterval: stagger)
         }
     }
+    // As the app does: a soak run must not be slowed by idle maintenance the app never sees.
+    let recording = SystemActivity.recording(reason: "isorec is recording")
     session.startAll()
     let stoppedEarly = DispatchSemaphore(value: 0)
     session.onStoppedForDiskSpace = {
@@ -130,8 +133,11 @@ case "record":
     }
     let liveRate = session.health.writeBytesPerSecond
     session.stopAll()
+    recording.end()
+    let finishing = SystemActivity.finishing(reason: "isorec is finishing recordings")
     sources.forEach { $0.cancel() }
     session.waitUntilFinished()
+    finishing.end()
     for recorder in recorders {
         let status = recorder.status()
         print("\(recorder.label): frames=\(status.totalFrames) repeated=\(status.repeatedFrames) restarts=\(status.restarts) gap=\(status.gapFrames) peakRing=\(Int(status.peakRingFill * 100))%")
